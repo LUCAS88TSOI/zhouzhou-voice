@@ -20,7 +20,11 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from llm.client import LLMClient
-from llm.provider import ProviderInfo, get_active_provider
+from llm.provider import (
+    ProviderInfo,
+    get_active_provider,
+    list_available_providers,
+)
 from utils.logger import get_logger
 
 logger = get_logger("llm.processor")
@@ -103,6 +107,16 @@ _HOTWORD_INJECT_TEMPLATE: str = (
 
 _MAX_HISTORY_TURNS: int = 10
 
+# A1：auth/quota/網路類錯誤 → 值得切後備 provider 重試
+_FAILOVER_ERROR_MARKERS: tuple[str, ...] = (
+    "401", "403", "429", "API Key", "權限不足", "配額",
+    "網路連線失敗", "連線逾時", "伺服器錯誤", "HTTP 5",
+)
+# key 永久失效 → 加入 session 黑名單長期跳過（429/網路屬暫時，不列入）
+_PERMANENT_FAILURE_MARKERS: tuple[str, ...] = (
+    "401", "403", "API Key", "權限不足",
+)
+
 
 # ─── 處理器 ────────────────────────────────────────────────
 
@@ -142,6 +156,8 @@ class LLMProcessor:
         # _append_history 比對 expected_epoch，不一致則 skip（避免 clear 後 in-flight
         # process 仍寫回舊歷史 → 上下文洩漏）。
         self._history_epoch: int = 0
+        # A1：運行時 auth 失敗（401/403）的 provider key → 後續降級時跳過
+        self._failed_providers: set[str] = set()
 
         self._init_client()
 
@@ -187,6 +203,7 @@ class LLMProcessor:
                 logger.warning(reason)
                 return LLMResult(text=text, elapsed_time=0.0, error=reason)
             client_snapshot = self._client
+            provider_snapshot = self._provider
             history_snapshot = (
                 list(self._conversation_history) if role.enable_history else []
             )
@@ -213,11 +230,31 @@ class LLMProcessor:
             should_stop=should_stop,
         )
 
+        # A1：運行時自動降級 — auth/quota/網路類錯誤 → 試其他可用 provider。
+        # 修復 provider.py 盲點：非空但失效的 key (is_available=True) 唔會喺
+        # init 時被跳過，只有實際呼叫先知 401，所以降級必須喺呼叫失敗後做。
+        if (
+            result.error
+            and not result.was_stopped
+            and self._matches(result.error, _FAILOVER_ERROR_MARKERS)
+        ):
+            result = self._failover(
+                messages=messages,
+                failed_provider=provider_snapshot,
+                first_error=result.error,
+                on_token=on_token,
+                should_stop=should_stop,
+            )
+
         result.elapsed_time = time.monotonic() - start_time
 
         # LLM 呼叫完成但回應為空（API 錯誤等）→ 回傳原文並記錄錯誤
         if not result.text and not result.was_stopped and not result.error:
             result.error = "❌ LLM 回應為空（模型未返回任何內容，請檢查模型名稱是否正確）"
+            result.text = text
+
+        # 降級後仍失敗 → fallback 原文，讓上層貼出未潤色文字
+        if result.error and not result.text:
             result.text = text
 
         # 記錄對話歷史（_append_history 內部加鎖 + epoch 檢查）
@@ -276,22 +313,69 @@ class LLMProcessor:
             logger.info("無活躍服務商，LLM 客戶端未初始化")
             return
 
-        temperature: float = getattr(self._llm_config, "temperature", 0.3)
-        max_tokens: int = getattr(self._llm_config, "max_tokens", 1024)
-        top_p: float = getattr(self._llm_config, "top_p", 1.0)
-        frequency_penalty: float = getattr(self._llm_config, "frequency_penalty", 0.0)
-        presence_penalty: float = getattr(self._llm_config, "presence_penalty", 0.0)
-        do_sample: bool = getattr(self._llm_config, "do_sample", True)
+        self._client = self._build_client(self._provider)
 
-        self._client = LLMClient(
-            provider=self._provider,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            top_p=top_p,
-            frequency_penalty=frequency_penalty,
-            presence_penalty=presence_penalty,
-            do_sample=do_sample,
+    def _build_client(self, provider: ProviderInfo) -> LLMClient:
+        """用當前 LLM 參數為指定 provider 建立 client（init 與降級共用）。"""
+        return LLMClient(
+            provider=provider,
+            temperature=getattr(self._llm_config, "temperature", 0.3),
+            max_tokens=getattr(self._llm_config, "max_tokens", 1024),
+            top_p=getattr(self._llm_config, "top_p", 1.0),
+            frequency_penalty=getattr(self._llm_config, "frequency_penalty", 0.0),
+            presence_penalty=getattr(self._llm_config, "presence_penalty", 0.0),
+            do_sample=getattr(self._llm_config, "do_sample", True),
         )
+
+    @staticmethod
+    def _matches(error: str, markers: tuple[str, ...]) -> bool:
+        """error 訊息是否包含任一標記。"""
+        return any(m in error for m in markers)
+
+    def _failover(
+        self,
+        messages: list[dict[str, str]],
+        failed_provider: ProviderInfo | None,
+        first_error: str,
+        on_token: Callable[[str], None] | None,
+        should_stop: Callable[[], bool] | None,
+    ) -> LLMResult:
+        """
+        當前 provider auth/quota/網路失敗 → 依序試其他可用 provider。
+
+        - 永久失效（401/403）的 provider 加入 session 黑名單，後續直接跳過。
+        - 暫時性失敗（429/網路）不入黑名單，下次仍會嘗試。
+        - 全部失敗時回傳最後一個 result（error 非空），由 process() fallback 原文。
+        """
+        if failed_provider is not None and self._matches(
+            first_error, _PERMANENT_FAILURE_MARKERS
+        ):
+            self._failed_providers.add(failed_provider.key)
+
+        failed_key = failed_provider.key if failed_provider else None
+        last = LLMResult(text="", error=first_error)
+
+        for prov in list_available_providers(self._config):
+            if prov.key == failed_key or prov.key in self._failed_providers:
+                continue
+            logger.warning(
+                "LLM 降級：改試後備 provider %s (%s)", prov.key, prov.name
+            )
+            result = self._stream_chat(
+                client=self._build_client(prov),
+                messages=messages,
+                on_token=on_token,
+                should_stop=should_stop,
+            )
+            if not result.error:
+                logger.info("LLM 降級成功：%s (%s)", prov.key, prov.name)
+                return result
+            if self._matches(result.error, _PERMANENT_FAILURE_MARKERS):
+                self._failed_providers.add(prov.key)
+            last = result
+
+        logger.error("LLM 降級失敗：冇可用 provider")
+        return last
 
     def _is_ready(self) -> bool:
         """檢查 LLM 是否就緒。"""

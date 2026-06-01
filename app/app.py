@@ -638,6 +638,11 @@ class VoiceApp:
             self._invoke_gui("set_status", (str, "LLM 處理中..."))
             result = self._try_llm_polish(source, role_override=repolish_role, llm_processor=llm_processor)
             polished = result.text
+            if not result.success:
+                self._invoke_gui(
+                    "notify_warning",
+                    (str, "⚠ 重新潤色失敗（請檢查網絡或 API Key）"),
+                )
             self._last_result = polished
 
             logger.info("重新潤色結果: %s", polished)
@@ -834,8 +839,16 @@ class VoiceApp:
                 result = self._try_llm_polish(text)
                 text = result.text
                 timings["LLM"] = time.monotonic() - t
-                if timings["LLM"] > 0.01:
-                    logger.info("LLM 潤色後: %s", text)
+                if result.success:
+                    if timings["LLM"] > 0.01:
+                        logger.info("LLM 潤色後: %s", text)
+                else:
+                    # A2：潤色失敗唔好靜默 —— 貼出嘅係未潤色原文，彈托盤通知俾用戶知
+                    logger.warning("LLM 潤色失敗，貼出未潤色原文（error=%s）", result.error)
+                    self._invoke_gui(
+                        "notify_warning",
+                        (str, "⚠ 潤色失敗，已貼原文（請檢查網絡或 API Key）"),
+                    )
             else:
                 timings["LLM"] = 0.0  # 未調用 LLM
 

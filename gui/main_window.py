@@ -209,6 +209,13 @@ class MainWindow(QMainWindow):
 
         logger.debug("狀態更新: %s", status)
 
+    @Slot(str)
+    def notify_warning(self, message: str) -> None:
+        """彈出托盤警告通知（潤色失敗等需用戶察覺的情況，唔好靜默）。"""
+        if self._tray is not None:
+            self._tray.show_message("CC語音", message)
+        logger.warning("用戶提示: %s", message)
+
     def _sync_indicator_state(self, status: str) -> None:
         """根據主視窗狀態同步浮窗顏色與文字。
 

@@ -135,6 +135,81 @@ def test_sync_indicator_limit_status_shows_indicator():
     assert _categorize_status("未知狀態") == "hide"
 
 
+# ─── P4: LLM 運行時自動降級（auth/quota 錯誤切後備 provider）─────
+
+def _make_failover_config(active_key="dead"):
+    """構造帶兩個可用 provider 的 fake config（active 會 401，backup 正常）。"""
+    class _LLM:
+        enabled = True
+        active_provider = active_key
+        temperature = 0.1
+        max_tokens = 100
+        top_p = 1.0
+        frequency_penalty = 0.0
+        presence_penalty = 0.0
+        do_sample = True
+        custom_roles: list = []
+        builtin_overrides: dict = {}
+        providers = {
+            "dead": {"name": "Dead", "api_url": "https://dead.example/v1",
+                     "api_key": "deadkey", "model": "m1", "enabled": True},
+            "backup": {"name": "Backup", "api_url": "https://backup.example/v1",
+                       "api_key": "backupkey", "model": "m2", "enabled": True},
+        }
+
+    class _Cfg:
+        llm = _LLM()
+
+    return _Cfg()
+
+
+class _FakeClient:
+    """模擬 LLMClient：text=None 代表會拋 401 的死 key。"""
+
+    def __init__(self, text):
+        self._text = text
+
+    def chat_with_warnings(self, messages, stream=True):
+        if self._text is None:
+            def _gen():
+                raise RuntimeError("API Key 無效（HTTP 401）")
+                yield ""  # 令此函數成為 generator（與真 client 一致，惰性拋錯）
+            return _gen(), []
+        return iter([self._text]), []
+
+
+def test_llm_failover_on_auth_error():
+    """active provider 回 401 → 自動切到 backup provider 並成功。"""
+    from unittest.mock import patch
+    from llm.processor import LLMProcessor, RoleConfig
+
+    def _fake_build(self, provider):
+        return _FakeClient("潤色後結果" if provider.key == "backup" else None)
+
+    with patch.object(LLMProcessor, "_build_client", _fake_build):
+        proc = LLMProcessor(_make_failover_config())
+        result = proc.process("呢句嘢夠長要潤色", RoleConfig(name="default", system_prompt="潤色"))
+
+    assert result.error == "", f"降級後應無錯誤，實際: {result.error!r}"
+    assert result.text == "潤色後結果", f"應為 backup 結果，實際: {result.text!r}"
+
+
+def test_llm_failover_all_dead_returns_error():
+    """所有 provider 都 401 → graceful 返回 error + 原文（不崩潰）。"""
+    from unittest.mock import patch
+    from llm.processor import LLMProcessor, RoleConfig
+
+    def _all_dead(self, provider):
+        return _FakeClient(None)
+
+    with patch.object(LLMProcessor, "_build_client", _all_dead):
+        proc = LLMProcessor(_make_failover_config())
+        result = proc.process("呢句嘢夠長要潤色", RoleConfig(name="default", system_prompt="潤色"))
+
+    assert result.error != "", "全部死 key 應有 error"
+    assert result.text == "呢句嘢夠長要潤色", "失敗應 fallback 原文"
+
+
 if __name__ == "__main__":
     # 可直接 python tests/test_fixes.py 執行
     import traceback
@@ -149,6 +224,8 @@ if __name__ == "__main__":
         test_transcribe_signal_carries_config,
         test_transcribe_get_config_reads_checkboxes,
         test_sync_indicator_limit_status_shows_indicator,
+        test_llm_failover_on_auth_error,
+        test_llm_failover_all_dead_returns_error,
     ]
     failed = 0
     for t in tests:
