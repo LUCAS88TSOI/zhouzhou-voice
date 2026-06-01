@@ -139,6 +139,7 @@ class LifecycleManager:
 
         # 已在關閉流程中 → 強制退出
         if self._is_shutting_down:
+            # signal handler — print() is safe here; logger may deadlock
             print(f"\n強制退出（{sig_name}）...")
             sys.exit(1)
 
@@ -147,10 +148,12 @@ class LifecycleManager:
         if now - self._last_signal_time > 1.0:
             # 第一次：重置計時，提示用戶
             self._last_signal_time = now
+            # signal handler — print() is safe here; logger may deadlock
             print(f"\n收到 {sig_name}，再按一次確認退出")
             return
 
         # 1 秒內第二次：觸發關閉
+        # signal handler — print() is safe here; logger may deadlock
         print(f"\n收到第二次 {sig_name}，正在退出...")
         self.request_shutdown(reason=f"Signal {sig_name}")
 
