@@ -4,8 +4,6 @@ __pycache__/
 *$py.class
 *.egg-info/
 dist/
-build/
-!build/build.bat
 *.egg
 
 # Virtual environments
