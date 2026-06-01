@@ -1,0 +1,35 @@
+# ZhouZhou Voice - Python Dependencies
+# Install: pip install -r requirements.txt
+
+# Core - ASR engine
+sherpa-onnx>=1.12.0
+numpy>=2.0.0
+
+# Core - Audio recording
+sounddevice>=0.5.0
+
+# Core - Hotkey listening
+pynput>=1.8.0
+
+# Core - GUI
+PySide6>=6.10.0
+Pillow>=12.0.0
+
+# Core - Text processing
+pypinyin>=0.55.0
+opencc-python-reimplemented>=0.1.7
+
+# Core - HTTP connection pooling (LLM API)
+urllib3>=2.0.0
+certifi>=2024.0.0
+
+# Core - FFI (required by sherpa-onnx)
+cffi>=2.0.0
+
+# Core - FFmpeg fallback (當系統 PATH 無 ffmpeg 時使用內建版)
+imageio-ffmpeg>=0.5.0
+
+# Build only (not needed at runtime)
+# Nuitka>=4.0.0
+# ordered-set>=4.1.0
+# zstandard>=0.25.0

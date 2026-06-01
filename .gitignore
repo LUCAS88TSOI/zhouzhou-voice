@@ -1,0 +1,67 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+!build/build.bat
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Logs
+logs/
+*.log
+
+# Model files (too large for git)
+models/sensevoice/*.onnx
+models/sensevoice/*.bin
+
+# Config (user-specific, auto-generated)
+# config.json is in %APPDATA%, not in repo
+
+# Nuitka build output
+*.build/
+*.dist/
+*.onefile-build/
+nuitka-crash-report.xml
+
+# Windows reserved filenames (artifacts)
+nul
+models/sensevoice-yue/
+
+.vercel
+
+# Environment variables (secrets)
+.env
+.env.*
+
+# Claude Code 本地設定（整個目錄）
+.claude/
+.tdd-loop/
+
+# 測試/工具暫存與快取
+.tmp/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# 私有提示詞 overlay（開放核心：將來優化版提示詞，唔入公開 repo）
+llm/roles/_private_overrides.json
