@@ -66,6 +66,8 @@ class SettingsPanel(QWidget):
     """
 
     mic_test_requested = Signal()  # 請求開啟麥克風測試
+    # 背景抓取模型清單完成：(provider_key, models, error_msg)
+    _models_fetched = Signal(str, list, str)
 
     def __init__(
         self,
@@ -79,6 +81,9 @@ class SettingsPanel(QWidget):
         # 服務商欄位暫存快取 & 當前編輯中的 provider key
         self._provider_cache_store: Dict[str, Dict[str, str]] = {}
         self._current_provider_key: str = ""
+        # 正在背景抓取模型清單的 provider（防重複觸發）
+        self._fetching_models: set[str] = set()
+        self._models_fetched.connect(self._on_models_fetched)
 
         # ── 主佈局 ────────────────────────────────
         layout = QVBoxLayout(self)
@@ -308,6 +313,11 @@ class SettingsPanel(QWidget):
         self._model_input.setEditable(True)
         self._model_input.lineEdit().setPlaceholderText("模型名稱")
         model_row.addWidget(self._model_input, stretch=1)
+        self._refresh_models_btn = QPushButton("🔄")
+        self._refresh_models_btn.setFixedWidth(28)
+        self._refresh_models_btn.setToolTip("從供應商取得最新模型清單")
+        self._refresh_models_btn.clicked.connect(self._on_refresh_models_clicked)
+        model_row.addWidget(self._refresh_models_btn)
         self._del_model_btn = QPushButton("×")
         self._del_model_btn.setFixedWidth(28)
         self._del_model_btn.setToolTip("刪除此模型歷史記錄")
@@ -563,12 +573,12 @@ class SettingsPanel(QWidget):
             self._repolish_api_url_input.setText(provider.get("api_url", ""))
             self._repolish_api_key_input.setText(provider.get("api_key", ""))
 
-            # 重建模型下拉
-            self._repolish_model_input.clear()
-            model_history = provider.get("model_history", [])
-            if model_history:
-                self._repolish_model_input.addItems(model_history)
-            self._repolish_model_input.setCurrentText(llm.repolish_model or provider.get("model", ""))
+            # 重建模型下拉（API 清單 + 歷史）
+            self._populate_model_combo(
+                self._repolish_model_input, llm.repolish_provider,
+                list(provider.get("model_history", [])),
+                llm.repolish_model or provider.get("model", ""),
+            )
         else:
             self._repolish_provider_combo.setCurrentIndex(0)  # "與主服務商相同"
             self._repolish_fields_widget.setVisible(False)
@@ -615,31 +625,147 @@ class SettingsPanel(QWidget):
             }
         self._current_provider_key = new_key
         self._sync_provider_fields(new_key)
+        self._maybe_fetch_models()
 
     def _sync_provider_fields(self, provider_key: str) -> None:
-        """將指定服務商的 API Key 和模型填入輸入框，並載入模型歷史下拉選項。"""
+        """將指定服務商的 API Key 和模型填入，下拉載入 API 模型清單（快取）+ 歷史。
+
+        若快取過期且已有 API Key，背景抓取最新清單（不卡 UI）。
+        """
+        self._current_provider_key = provider_key
         provider = self._config.llm.providers.get(provider_key, {})
         cached = self._provider_cache_store.get(provider_key)
 
-        # 重建模型下拉歷史（不觸發不必要的信號）
-        self._model_input.blockSignals(True)
-        self._api_key_input.blockSignals(True)
-        self._model_input.clear()
-        history = provider.get("model_history", [])
-        if history:
-            self._model_input.addItems(history)
-
         if cached is not None:
-            self._api_key_input.setText(cached.get("api_key", ""))
-            self._model_input.setCurrentText(cached.get("model", ""))
-            self._api_url_input.setText(cached.get("api_url", ""))
+            api_key = cached.get("api_key", "")
+            model = cached.get("model", "")
+            api_url = cached.get("api_url", "")
         else:
-            self._api_key_input.setText(provider.get("api_key", ""))
-            self._model_input.setCurrentText(provider.get("model", ""))
-            self._api_url_input.setText(provider.get("api_url", ""))
+            api_key = provider.get("api_key", "")
+            model = provider.get("model", "")
+            api_url = provider.get("api_url", "")
 
-        self._model_input.blockSignals(False)
+        self._api_key_input.blockSignals(True)
+        self._api_key_input.setText(api_key)
+        self._api_url_input.setText(api_url)
         self._api_key_input.blockSignals(False)
+
+        # 模型下拉：API 清單（快取）為主，歷史補上不重複者
+        # 注意：此處只「讀快取」，不主動抓網路。背景抓取由 _maybe_fetch_models()
+        # 在「打開設定頁 / 切換供應商」時觸發（避免 app 啟動載入設定就連網）。
+        history = list(provider.get("model_history", []))
+        self._populate_model_combo(self._model_input, provider_key, history, model)
+
+    def _populate_model_combo(
+        self, combo: QComboBox, provider_key: str,
+        history: list[str], current_text: str,
+    ) -> None:
+        """用快取的 API 模型清單 + 歷史填充下拉，保留當前選字。"""
+        from llm import model_cache
+        fetched, _age = model_cache.get(provider_key)
+        merged: list[str] = []
+        seen: set[str] = set()
+        for m in [*(fetched or []), *history]:
+            if m and m not in seen:
+                seen.add(m)
+                merged.append(m)
+        combo.blockSignals(True)
+        combo.clear()
+        if merged:
+            combo.addItems(merged)
+        combo.setCurrentText(current_text)
+        combo.blockSignals(False)
+
+    def showEvent(self, event) -> None:  # noqa: N802 — Qt override
+        """設定面板顯示時，自動抓當前供應商的模型清單（若快取過期）。"""
+        super().showEvent(event)
+        self._maybe_fetch_models()
+
+    def _maybe_fetch_models(self) -> None:
+        """當前 provider 快取過期且有 key/url → 背景抓取（不卡 UI）。"""
+        from llm import model_cache
+        provider_key = self._current_provider_key
+        if not provider_key or not model_cache.is_stale(provider_key):
+            return
+        api_url = self._api_url_input.text().strip()
+        api_key = self._api_key_input.text().strip()
+        if api_key and api_url:
+            self._start_model_fetch(provider_key, api_url, api_key)
+
+    def _start_model_fetch(
+        self, provider_key: str, api_url: str, api_key: str,
+    ) -> None:
+        """背景執行緒抓取模型清單；完成後經 _models_fetched 信號回主線程。"""
+        if provider_key in self._fetching_models:
+            return
+        self._fetching_models.add(provider_key)
+
+        def _worker() -> None:
+            from llm.model_fetcher import fetch_models
+            from llm.provider import ProviderInfo
+            try:
+                models = fetch_models(ProviderInfo(
+                    key=provider_key, name=provider_key,
+                    api_url=api_url, api_key=api_key, model="", enabled=True,
+                ))
+                self._models_fetched.emit(provider_key, models, "")
+            except Exception as err:  # noqa: BLE001 — 任何失敗都回報給 UI
+                self._models_fetched.emit(provider_key, [], str(err))
+
+        import threading
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_models_fetched(
+        self, provider_key: str, models: list, error: str,
+    ) -> None:
+        """背景抓取完成（主線程 slot）。"""
+        self._fetching_models.discard(provider_key)
+        self._refresh_models_btn.setEnabled(True)
+
+        if error:
+            logger.info("模型清單抓取失敗 (%s): %s", provider_key, error)
+            if provider_key == self._current_provider_key:
+                self._test_result_label.setStyleSheet(
+                    "font-size: 11px; color: #d32f2f;"
+                )
+                self._test_result_label.setText(f"模型更新失敗：{error}")
+            return
+
+        from llm import model_cache
+        model_cache.set(provider_key, models)
+        logger.info("模型清單已更新 (%s): %d 個", provider_key, len(models))
+
+        # 若使用者仍停在該 provider，刷新下拉（保留當前選字）
+        if provider_key == self._current_provider_key:
+            history = list(
+                self._config.llm.providers.get(provider_key, {}).get(
+                    "model_history", []
+                )
+            )
+            self._populate_model_combo(
+                self._model_input, provider_key, history,
+                self._model_input.currentText(),
+            )
+            self._test_result_label.setStyleSheet(
+                "font-size: 11px; color: #4CAF50;"
+            )
+            self._test_result_label.setText(f"已更新 {len(models)} 個模型")
+
+    def _on_refresh_models_clicked(self) -> None:
+        """手動更新模型清單（忽略 TTL）。"""
+        provider_key = self._provider_combo.get_provider_key()
+        api_url = self._api_url_input.text().strip()
+        api_key = self._api_key_input.text().strip()
+        if not api_key or not api_url:
+            self._test_result_label.setStyleSheet(
+                "font-size: 11px; color: #d32f2f;"
+            )
+            self._test_result_label.setText("請先填 API URL 與 API Key")
+            return
+        self._refresh_models_btn.setEnabled(False)
+        self._test_result_label.setStyleSheet("font-size: 11px; color: #888;")
+        self._test_result_label.setText("更新模型中…")
+        self._start_model_fetch(provider_key, api_url, api_key)
 
     def _save_current_provider_fields(self) -> None:
         """將目前 API Key / Model 欄位的值暫存到快取。"""
@@ -834,11 +960,9 @@ class SettingsPanel(QWidget):
             self._repolish_api_key_input.setText(provider.get("api_key", ""))
             self._repolish_api_key_input.setReadOnly(True)
 
-            # 重建模型下拉
-            self._repolish_model_input.blockSignals(True)
-            self._repolish_model_input.clear()
-            model_history = provider.get("model_history", [])
-            if model_history:
-                self._repolish_model_input.addItems(model_history)
-            self._repolish_model_input.setCurrentText(provider.get("model", ""))
-            self._repolish_model_input.blockSignals(False)
+            # 重建模型下拉（API 清單 + 歷史）
+            self._populate_model_combo(
+                self._repolish_model_input, provider_key,
+                list(provider.get("model_history", [])),
+                provider.get("model", ""),
+            )

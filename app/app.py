@@ -836,12 +836,19 @@ class VoiceApp:
             t = time.monotonic()
             if self._config and self._config.llm.enabled and not skip_llm:
                 self._invoke_gui("set_status", (str, "潤色中..."))
-                result = self._try_llm_polish(text)
+                result = self._try_llm_polish(text, enforce_timeout=True)
                 text = result.text
                 timings["LLM"] = time.monotonic() - t
                 if result.success:
                     if timings["LLM"] > 0.01:
                         logger.info("LLM 潤色後: %s", text)
+                elif result.error == "潤色逾時":
+                    # 逾時 → 貼原文 + 專屬提示
+                    _to = int(self._config.llm.polish_timeout)
+                    self._invoke_gui(
+                        "notify_warning",
+                        (str, f"⚠ 潤色逾時（>{_to}s），已貼原文"),
+                    )
                 else:
                     # A2：潤色失敗唔好靜默 —— 貼出嘅係未潤色原文，彈托盤通知俾用戶知
                     logger.warning("LLM 潤色失敗，貼出未潤色原文（error=%s）", result.error)
@@ -1079,17 +1086,24 @@ class VoiceApp:
         logger.info("分段識別完成: %d 段拼接 → %d 字", total_segs, len(merged))
         return merged
 
-    def _try_llm_polish(self, text: str, role_override: str = "", llm_processor=None):
+    def _try_llm_polish(
+        self, text: str, role_override: str = "", llm_processor=None,
+        enforce_timeout: bool = False,
+    ):
         """嘗試用 LLM 潤色文字。返回結構化狀態。
 
         Args:
             text: 要潤色的文字
             role_override: 覆蓋角色 ID，空字串使用預設角色
             llm_processor: 覆蓋 LLM 處理器，None 使用預設處理器
+            enforce_timeout: True 時套用 polish_timeout 上限，逾時直接回原文
+                             （僅主語音管線用；repolish / 檔案轉錄不套）
 
         Returns:
             LLMResultStatus: 結構化狀態（含 success, text, was_processed, error）
         """
+        import time as _time
+
         from llm.processor import LLMResultStatus
 
         processor = llm_processor or self._llm
@@ -1116,12 +1130,33 @@ class VoiceApp:
 
             self._invoke_gui("set_status", (str, "LLM 處理中..."))
 
+            # 逾時保護：超過 polish_timeout 秒自動停止，貼出未潤色原文
+            timeout_s = self._config.llm.polish_timeout if self._config else 0.0
+            should_stop = None
+            request_timeout = None
+            if enforce_timeout and timeout_s and timeout_s > 0:
+                deadline = _time.monotonic() + timeout_s
+                should_stop = lambda: _time.monotonic() >= deadline  # noqa: E731
+                request_timeout = timeout_s
+
             logger.info("LLM 潤色中...")
             result = processor.process(
                 text=text,
                 role=role,
                 hotword_context=hotword_ctx,
+                should_stop=should_stop,
+                request_timeout=request_timeout,
             )
+
+            # 逾時觸發 → 丟棄半截潤色，回傳原文
+            if result.was_stopped:
+                logger.warning("LLM 潤色逾時（>%.0fs），貼出未潤色原文", timeout_s)
+                return LLMResultStatus(
+                    success=False,
+                    text=text,
+                    was_processed=True,
+                    error="潤色逾時",
+                )
 
             # 有錯誤 → 顯示到主視窗讓用戶知道
             if result.error:

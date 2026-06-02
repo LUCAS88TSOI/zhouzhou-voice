@@ -161,6 +161,7 @@ class LLMConfig:
     repolish_provider: str = ""         # 重新潤色專用服務商，空字串 = 使用 active_provider
     repolish_model: str = ""            # 重新潤色專用模型，空字串 = 使用服務商預設模型
     repolish_role: str = ""             # 重新潤色專用角色，空字串 = 使用 active_role
+    polish_timeout: float = 10.0        # 語音潤色逾時上限（秒），超時直接貼原文；0 = 不限制
 
 
 @dataclass(frozen=True)

@@ -170,6 +170,7 @@ class LLMProcessor:
         hotword_context: list[str] | None = None,
         on_token: Callable[[str], None] | None = None,
         should_stop: Callable[[], bool] | None = None,
+        request_timeout: float | None = None,
     ) -> LLMResult:
         """
         處理一段文字：建立訊息、呼叫 LLM、串流回傳結果。
@@ -204,6 +205,11 @@ class LLMProcessor:
                 return LLMResult(text=text, elapsed_time=0.0, error=reason)
             client_snapshot = self._client
             provider_snapshot = self._provider
+            # 逾時保護：用帶 timeout 的臨時 client，避免 stall 卡到預設 30s
+            if request_timeout is not None and provider_snapshot is not None:
+                client_snapshot = self._build_client(
+                    provider_snapshot, timeout=request_timeout,
+                )
             history_snapshot = (
                 list(self._conversation_history) if role.enable_history else []
             )
@@ -244,6 +250,7 @@ class LLMProcessor:
                 first_error=result.error,
                 on_token=on_token,
                 should_stop=should_stop,
+                request_timeout=request_timeout,
             )
 
         result.elapsed_time = time.monotonic() - start_time
@@ -315,17 +322,26 @@ class LLMProcessor:
 
         self._client = self._build_client(self._provider)
 
-    def _build_client(self, provider: ProviderInfo) -> LLMClient:
-        """用當前 LLM 參數為指定 provider 建立 client（init 與降級共用）。"""
-        return LLMClient(
-            provider=provider,
-            temperature=getattr(self._llm_config, "temperature", 0.3),
-            max_tokens=getattr(self._llm_config, "max_tokens", 1024),
-            top_p=getattr(self._llm_config, "top_p", 1.0),
-            frequency_penalty=getattr(self._llm_config, "frequency_penalty", 0.0),
-            presence_penalty=getattr(self._llm_config, "presence_penalty", 0.0),
-            do_sample=getattr(self._llm_config, "do_sample", True),
-        )
+    def _build_client(
+        self, provider: ProviderInfo, timeout: float | None = None,
+    ) -> LLMClient:
+        """用當前 LLM 參數為指定 provider 建立 client（init 與降級共用）。
+
+        timeout 非 None 時覆蓋預設 read timeout（語音潤色逾時保護用），
+        確保連線 stall 時單一請求不會卡到預設 30s。
+        """
+        kwargs: dict[str, Any] = {
+            "provider": provider,
+            "temperature": getattr(self._llm_config, "temperature", 0.3),
+            "max_tokens": getattr(self._llm_config, "max_tokens", 1024),
+            "top_p": getattr(self._llm_config, "top_p", 1.0),
+            "frequency_penalty": getattr(self._llm_config, "frequency_penalty", 0.0),
+            "presence_penalty": getattr(self._llm_config, "presence_penalty", 0.0),
+            "do_sample": getattr(self._llm_config, "do_sample", True),
+        }
+        if timeout is not None and timeout > 0:
+            kwargs["timeout"] = max(1, int(timeout))
+        return LLMClient(**kwargs)
 
     @staticmethod
     def _matches(error: str, markers: tuple[str, ...]) -> bool:
@@ -339,12 +355,14 @@ class LLMProcessor:
         first_error: str,
         on_token: Callable[[str], None] | None,
         should_stop: Callable[[], bool] | None,
+        request_timeout: float | None = None,
     ) -> LLMResult:
         """
         當前 provider auth/quota/網路失敗 → 依序試其他可用 provider。
 
         - 永久失效（401/403）的 provider 加入 session 黑名單，後續直接跳過。
         - 暫時性失敗（429/網路）不入黑名單，下次仍會嘗試。
+        - 截止時間已到（should_stop）→ 立即中止，不再試後備（杜絕 30s×N）。
         - 全部失敗時回傳最後一個 result（error 非空），由 process() fallback 原文。
         """
         if failed_provider is not None and self._matches(
@@ -356,13 +374,16 @@ class LLMProcessor:
         last = LLMResult(text="", error=first_error)
 
         for prov in list_available_providers(self._config):
+            if should_stop is not None and should_stop():
+                logger.info("LLM 降級中止：已達潤色截止時間")
+                break
             if prov.key == failed_key or prov.key in self._failed_providers:
                 continue
             logger.warning(
                 "LLM 降級：改試後備 provider %s (%s)", prov.key, prov.name
             )
             result = self._stream_chat(
-                client=self._build_client(prov),
+                client=self._build_client(prov, timeout=request_timeout),
                 messages=messages,
                 on_token=on_token,
                 should_stop=should_stop,
