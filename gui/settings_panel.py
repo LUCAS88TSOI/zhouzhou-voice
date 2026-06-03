@@ -56,6 +56,11 @@ from utils.logger import get_logger
 
 logger = get_logger("settings_panel")
 
+# 專案與贊助連結（單一來源，README 與測試共用此處定義的值）
+PROJECT_URL = "https://github.com/LUCAS88TSOI/zhouzhou-voice"
+DONATE_URL = "https://github.com/LUCAS88TSOI/zhouzhou-voice#贊助支持"
+PAYME_URL = "https://payme.hsbc/289b982f31514bdfafa7d3e597aa1ab2"
+
 
 class SettingsPanel(QWidget):
     """
@@ -512,12 +517,31 @@ class SettingsPanel(QWidget):
         layout.addWidget(license_group)
 
         link = QLabel(
-            '<a href="https://github.com/your-org/zhouzhou-voice">'
+            '<a href="https://github.com/LUCAS88TSOI/zhouzhou-voice">'
             "GitHub 專案頁面</a>"
         )
         link.setOpenExternalLinks(True)
         link.setTextFormat(Qt.TextFormat.RichText)
         layout.addWidget(link)
+
+        # ── 贊助支持 ──────────────────────────────
+        donate_group = QGroupBox("贊助支持")
+        donate_layout = QVBoxLayout(donate_group)
+
+        donate_hint = QLabel(
+            "州州語音免費開源，由業餘時間維護。\n"
+            "如果幫到你，歡迎請我飲杯咖啡 ☕，畀啲動力我繼續更新 🙏"
+        )
+        donate_hint.setWordWrap(True)
+        donate_layout.addWidget(donate_hint)
+
+        donate_btn = QPushButton("💛  贊助支持作者")
+        donate_btn.setFixedWidth(160)
+        donate_btn.setToolTip("開啟贊助頁面（PayMe 一掃即過數）")
+        donate_btn.clicked.connect(self._open_donate_page)
+        donate_layout.addWidget(donate_btn)
+
+        layout.addWidget(donate_group)
 
         mic_test_btn = QPushButton("測試麥克風")
         mic_test_btn.setFixedWidth(120)
@@ -526,6 +550,14 @@ class SettingsPanel(QWidget):
 
         layout.addStretch()
         return page
+
+    def _open_donate_page(self) -> None:
+        """以系統瀏覽器開啟官網贊助區（含 PayMe 一鍵過數連結）。"""
+        from PySide6.QtCore import QUrl
+        from PySide6.QtGui import QDesktopServices
+
+        QDesktopServices.openUrl(QUrl(DONATE_URL))
+        logger.info("開啟贊助頁面：%s", DONATE_URL)
 
     # ─────────────────────────────────────────────
     #  載入 / 讀取配置

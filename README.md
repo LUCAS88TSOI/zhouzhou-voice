@@ -224,6 +224,20 @@ zhouzhou-voice/
 
 ---
 
+## 贊助支持
+
+州州語音免費開源，由業餘時間維護更新。如果佢幫到你，歡迎請我飲杯咖啡 ☕，畀啲動力我繼續做落去 🙏
+
+**PayMe 一掃即過數：**
+
+<img src="assets/payme-qr.jpg" alt="PayMe 贊助 QR Code" width="240">
+
+或一鍵開啟 👉 **[用 PayMe 贊助](https://payme.hsbc/289b982f31514bdfafa7d3e597aa1ab2)**
+
+完全自願，多謝你嘅支持！❤️
+
+---
+
 ## AI 助手開發
 
 如果你使用 Claude Code 或其他 AI 助手開發此專案，請讓 AI 先閱讀根目錄的 `CLAUDE.md`。
