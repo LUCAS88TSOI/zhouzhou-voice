@@ -516,10 +516,7 @@ class SettingsPanel(QWidget):
         license_layout.addWidget(licenses_text)
         layout.addWidget(license_group)
 
-        link = QLabel(
-            '<a href="https://github.com/LUCAS88TSOI/zhouzhou-voice">'
-            "GitHub 專案頁面</a>"
-        )
+        link = QLabel(f'<a href="{PROJECT_URL}">GitHub 專案頁面</a>')
         link.setOpenExternalLinks(True)
         link.setTextFormat(Qt.TextFormat.RichText)
         layout.addWidget(link)
