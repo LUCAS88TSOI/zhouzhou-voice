@@ -176,7 +176,9 @@ class HotwordConfig:
 class OutputConfig:
     """輸出配置"""
     paste_mode: bool = True
-    restore_clip: bool = True
+    # 預設不還原：識別結果留喺剪貼板，避免「貼上後 0.15s 還原」的時序競爭
+    # （慢應用未貼完就被還原 → 貼出舊內容）。想還原者可喺設定頁勾選。
+    restore_clip: bool = False
     traditional_convert: bool = True
     traditional_locale: str = "zh-hk"
     format_num: bool = True

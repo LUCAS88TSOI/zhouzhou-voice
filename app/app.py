@@ -650,9 +650,13 @@ class VoiceApp:
 
             if self._config and self._config.output.paste_mode:
                 from utils.clipboard import ClipboardManager
-                ClipboardManager.paste_text(
+                if not ClipboardManager.paste_text(
                     polished, restore=self._config.output.restore_clip
-                )
+                ):
+                    self._invoke_gui(
+                        "notify_warning",
+                        (str, "⚠ 貼上失敗，結果已喺剪貼板，可手動 Ctrl+V"),
+                    )
         except Exception as err:
             logger.error("重新潤色異常: %s", err, exc_info=True)
             final_status = "失敗"
@@ -878,15 +882,8 @@ class VoiceApp:
             if model_info_line:
                 self._invoke_gui("append_result", (str, model_info_line))
 
-            # 透過剪貼板粘貼
-            if self._config and self._config.output.paste_mode:
-                from utils.clipboard import ClipboardManager
-                ClipboardManager.paste_text(
-                    text,
-                    restore=self._config.output.restore_clip,
-                )
-
-            # ── 6. 儲存錄音歷史 ───────────────────────────────
+            # ── 6. 儲存錄音歷史（記錄優先：先落庫，再做輸出）──────────
+            #   置於剪貼板輸出之前，確保即使貼上/GUI 環節出錯，記錄都唔會遺失。
             if (
                 self._recording_db
                 and self._config
@@ -907,6 +904,18 @@ class VoiceApp:
                     self._invoke_gui("refresh_history")
                 except Exception as db_err:
                     logger.warning("儲存錄音歷史失敗: %s", db_err)
+
+            # ── 7. 透過剪貼板粘貼（輸出，置於記錄之後）──────────────
+            if self._config and self._config.output.paste_mode:
+                from utils.clipboard import ClipboardManager
+                if not ClipboardManager.paste_text(
+                    text,
+                    restore=self._config.output.restore_clip,
+                ):
+                    self._invoke_gui(
+                        "notify_warning",
+                        (str, "⚠ 貼上失敗，結果已喺剪貼板，可手動 Ctrl+V"),
+                    )
 
             # 流水線完整走到底且 text 非空 → 明確成功
             final_status = "完成"
@@ -1309,8 +1318,10 @@ class VoiceApp:
         """複製最後一次識別結果。"""
         if self._last_result:
             from utils.clipboard import ClipboardManager
-            ClipboardManager.write(self._last_result)
-            logger.info("已複製結果到剪貼板")
+            if ClipboardManager.set_text(self._last_result):
+                logger.info("已複製結果到剪貼板")
+            else:
+                logger.error("複製結果到剪貼板失敗")
 
     def _on_clear_memory(self) -> None:
         """清除 LLM 歷史。"""

@@ -27,6 +27,11 @@ logger = get_logger("clipboard")
 CF_UNICODETEXT = 13
 GMEM_MOVEABLE = 0x0002
 
+# 貼上後等幾耐先還原剪貼板（僅 restore=True 時）。
+# 由 0.15s 提升到 0.4s：俾慢應用（Electron/瀏覽器/遠端桌面）足夠時間讀取，
+# 避免未貼完就被還原成舊內容。
+_RESTORE_DELAY = 0.4
+
 _user32 = ctypes.windll.user32
 _kernel32 = ctypes.windll.kernel32
 
@@ -168,8 +173,8 @@ class ClipboardManager:
     def paste_text(
         cls,
         text: str,
-        restore: bool = True,
-    ) -> None:
+        restore: bool = False,
+    ) -> bool:
         """
         透過剪貼板粘貼文字到當前應用。
 
@@ -182,29 +187,42 @@ class ClipboardManager:
 
         Args:
             text: 要粘貼的文字
-            restore: 粘貼後是否恢復原始剪貼板內容
+            restore: 粘貼後是否恢復原始剪貼板內容（預設 False，結果留喺剪貼板）
+
+        Returns:
+            是否成功貼上（寫入剪貼板或 Ctrl+V 失敗時回 False，且不冒泡異常）
         """
         from utils.keyboard import KeyboardSimulator
 
-        # 1. 備份
-        original = None
-        if restore:
-            original = cls.get_text()
+        try:
+            # 1. 備份
+            original = None
+            if restore:
+                original = cls.get_text()
 
-        # 2. 寫入
-        if not cls.set_text(text):
-            logger.error("寫入剪貼板失敗，無法粘貼")
-            return
+            # 2. 寫入
+            if not cls.set_text(text):
+                logger.error("寫入剪貼板失敗，無法粘貼")
+                return False
 
-        # 3. 粘貼
-        time.sleep(0.02)
-        KeyboardSimulator.press_ctrl_v()
+            # 3. 粘貼
+            time.sleep(0.02)
+            if not KeyboardSimulator.press_ctrl_v():
+                logger.error("模擬 Ctrl+V 失敗，文字仍保留喺剪貼板")
+                return False
 
-        # 4. 恢復
-        if restore and original is not None:
-            time.sleep(0.15)  # 等待粘貼完成再恢復
-            cls.set_text(original)
-            logger.debug("剪貼板已恢復原始內容")
+            # 4. 恢復（成功貼上後才還原；失敗時保留結果俾用戶手動 Ctrl+V）
+            if restore and original is not None:
+                time.sleep(_RESTORE_DELAY)  # 等待粘貼完成再恢復
+                if cls.set_text(original):
+                    logger.debug("剪貼板已恢復原始內容")
+                else:
+                    logger.warning("還原剪貼板失敗，剪貼板留有識別結果")
+
+            return True
+        except Exception as err:  # noqa: BLE001 — 任何失敗都回報，避免被外層靜默吞掉
+            logger.error("粘貼流程異常: %s", err, exc_info=True)
+            return False
 
     @classmethod
     def clear(cls) -> None:

@@ -86,6 +86,8 @@ class SettingsPanel(QWidget):
         # 服務商欄位暫存快取 & 當前編輯中的 provider key
         self._provider_cache_store: Dict[str, Dict[str, str]] = {}
         self._current_provider_key: str = ""
+        # 各 provider 的置頂模型（編輯中暫存，儲存時寫回 config）
+        self._pinned_store: Dict[str, list[str]] = {}
         # 正在背景抓取模型清單的 provider（防重複觸發）
         self._fetching_models: set[str] = set()
         self._models_fetched.connect(self._on_models_fetched)
@@ -323,6 +325,15 @@ class SettingsPanel(QWidget):
         self._refresh_models_btn.setToolTip("從供應商取得最新模型清單")
         self._refresh_models_btn.clicked.connect(self._on_refresh_models_clicked)
         model_row.addWidget(self._refresh_models_btn)
+        self._pin_model_btn = QPushButton("📌")
+        self._pin_model_btn.setFixedWidth(28)
+        self._pin_model_btn.setCheckable(True)
+        self._pin_model_btn.setToolTip("置頂/取消置頂此模型（置頂者排喺清單最前）")
+        self._pin_model_btn.clicked.connect(self._on_toggle_pin_model)
+        model_row.addWidget(self._pin_model_btn)
+        self._model_input.currentTextChanged.connect(
+            lambda _=None: self._sync_pin_button()
+        )
         self._del_model_btn = QPushButton("×")
         self._del_model_btn.setFixedWidth(28)
         self._del_model_btn.setToolTip("刪除此模型歷史記錄")
@@ -570,6 +581,11 @@ class SettingsPanel(QWidget):
         self._repolish_instant_combo.setCurrentIndex(0 if sc.repolish_instant else 1)
 
         llm = config.llm
+        # 重建置頂模型快取（各 provider 獨立，容錯讀取）
+        self._pinned_store = {
+            pk: list(pv.get("pinned_models", []))
+            for pk, pv in llm.providers.items()
+        }
         self._llm_enabled_check.setChecked(llm.enabled)
 
         # 阻塞信號，防止觸發 _on_provider_changed 把空值寫入快取
@@ -689,21 +705,56 @@ class SettingsPanel(QWidget):
         self, combo: QComboBox, provider_key: str,
         history: list[str], current_text: str,
     ) -> None:
-        """用快取的 API 模型清單 + 歷史填充下拉，保留當前選字。"""
+        """填充下拉：置頂模型排最前 → 分隔線 → API 清單 + 歷史（去重）。保留當前選字。"""
         from llm import model_cache
         fetched, _age = model_cache.get(provider_key)
-        merged: list[str] = []
-        seen: set[str] = set()
+        pinned = [m for m in self._pinned_store.get(provider_key, []) if m]
+        # 其餘 = API 清單 + 歷史，去重且排除已置頂者
+        rest: list[str] = []
+        seen: set[str] = set(pinned)
         for m in [*(fetched or []), *history]:
             if m and m not in seen:
                 seen.add(m)
-                merged.append(m)
+                rest.append(m)
         combo.blockSignals(True)
         combo.clear()
-        if merged:
-            combo.addItems(merged)
+        if pinned:
+            combo.addItems(pinned)
+            if rest:
+                combo.insertSeparator(combo.count())
+        if rest:
+            combo.addItems(rest)
         combo.setCurrentText(current_text)
         combo.blockSignals(False)
+        if combo is self._model_input:
+            self._sync_pin_button()
+
+    def _sync_pin_button(self) -> None:
+        """根據當前模型是否已置頂，更新 📌 按鈕按下態。"""
+        model = self._model_input.currentText().strip()
+        pinned = self._pinned_store.get(self._current_provider_key, [])
+        self._pin_model_btn.blockSignals(True)
+        self._pin_model_btn.setChecked(bool(model) and model in pinned)
+        self._pin_model_btn.blockSignals(False)
+
+    def _on_toggle_pin_model(self) -> None:
+        """置頂 / 取消置頂當前模型（之後重填下拉，置頂者排最前）。"""
+        provider_key = self._current_provider_key
+        model = self._model_input.currentText().strip()
+        if not provider_key or not model:
+            self._sync_pin_button()  # 還原按鈕態（無有效模型時不置頂）
+            return
+        pinned = list(self._pinned_store.get(provider_key, []))
+        if model in pinned:
+            pinned.remove(model)
+        else:
+            pinned.insert(0, model)
+        self._pinned_store[provider_key] = pinned
+        history = list(
+            self._config.llm.providers.get(provider_key, {}).get("model_history", [])
+        )
+        # 重填下拉（保留當前選字）；內部會同步 📌 按鈕態
+        self._populate_model_combo(self._model_input, provider_key, history, model)
 
     def showEvent(self, event) -> None:  # noqa: N802 — Qt override
         """設定面板顯示時，自動抓當前供應商的模型清單（若快取過期）。"""
@@ -821,9 +872,10 @@ class SettingsPanel(QWidget):
                 if pkey == self._current_provider_key:
                     # 當前 provider：從 QComboBox 下拉項讀取 model_history
                     # （使用者的刪除/重置操作已反映在 UI 控件中）
+                    # 過濾分隔線（置頂產生的 itemText=""），避免空字串污染 model_history
                     ui_items = [
-                        self._model_input.itemText(i)
-                        for i in range(self._model_input.count())
+                        t for i in range(self._model_input.count())
+                        if (t := self._model_input.itemText(i).strip())
                     ]
                     if new_model and new_model not in ui_items:
                         ui_items.insert(0, new_model)
@@ -835,6 +887,11 @@ class SettingsPanel(QWidget):
                         history.remove(new_model)
                     history.insert(0, new_model)
                     providers[pkey]["model_history"] = history[:10]
+
+        # 寫回各 provider 的置頂模型（涵蓋只置頂、未改其他欄位的 provider）
+        for pkey, pinned in self._pinned_store.items():
+            if pkey in providers:
+                providers[pkey]["pinned_models"] = list(pinned)
 
         return providers
 

@@ -107,23 +107,31 @@ class KeyboardSimulator:
             cls._get_controller().release(pynput_key)
 
     @classmethod
-    def press_ctrl_v(cls) -> None:
+    def press_ctrl_v(cls) -> bool:
         """
         模擬 Ctrl+V（粘貼）。
 
         用於將剪貼板內容粘貼到當前焦點應用。
+
+        Returns:
+            是否成功（pynput 初始化或按鍵模擬失敗時回 False，不冒泡）
         """
         from pynput.keyboard import Key
 
-        ctrl = cls._get_controller()
-        ctrl.press(Key.ctrl_l)
-        time.sleep(0.01)
-        ctrl.press("v")
-        time.sleep(0.01)
-        ctrl.release("v")
-        ctrl.release(Key.ctrl_l)
-        time.sleep(0.05)  # 等待粘貼完成
-        logger.debug("已模擬 Ctrl+V")
+        try:
+            ctrl = cls._get_controller()
+            ctrl.press(Key.ctrl_l)
+            time.sleep(0.01)
+            ctrl.press("v")
+            time.sleep(0.01)
+            ctrl.release("v")
+            ctrl.release(Key.ctrl_l)
+            time.sleep(0.05)  # 等待粘貼完成
+            logger.debug("已模擬 Ctrl+V")
+            return True
+        except Exception as err:  # noqa: BLE001 — 任何失敗都回報，避免靜默冒泡
+            logger.error("模擬 Ctrl+V 失敗: %s", err, exc_info=True)
+            return False
 
     @classmethod
     def type_text(cls, text: str, interval: float = 0.01) -> None:
