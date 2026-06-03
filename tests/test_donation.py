@@ -21,12 +21,9 @@ def test_payme_url_is_exact() -> None:
     assert settings_panel.PAYME_URL == EXPECTED_PAYME_URL
 
 
-def test_donate_url_points_to_official_repo_support_section() -> None:
-    """App 捐款按鈕應跳轉到官網（公開倉）的贊助段落 anchor。"""
-    assert settings_panel.DONATE_URL.startswith(
-        "https://github.com/LUCAS88TSOI/zhouzhou-voice"
-    )
-    assert settings_panel.DONATE_URL.endswith("#贊助支持")
+def test_donate_url_points_to_official_site_support_section() -> None:
+    """App 捐款按鈕應跳轉到官網（Vercel）的贊助段落 #donate anchor。"""
+    assert settings_panel.DONATE_URL == "https://zhouzhou-voice.vercel.app/#donate"
 
 
 def test_project_url_is_real_not_placeholder() -> None:

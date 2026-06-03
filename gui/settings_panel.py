@@ -58,7 +58,7 @@ logger = get_logger("settings_panel")
 
 # 專案與贊助連結（單一來源，README 與測試共用此處定義的值）
 PROJECT_URL = "https://github.com/LUCAS88TSOI/zhouzhou-voice"
-DONATE_URL = "https://github.com/LUCAS88TSOI/zhouzhou-voice#贊助支持"
+DONATE_URL = "https://zhouzhou-voice.vercel.app/#donate"
 PAYME_URL = "https://payme.hsbc/289b982f31514bdfafa7d3e597aa1ab2"
 
 
