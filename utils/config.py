@@ -13,6 +13,9 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import tempfile
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -184,6 +187,9 @@ class OutputConfig:
     format_num: bool = True
     format_spell: bool = True
     trash_punc: str = "，。,."
+    # 標點移除模式：off=不移除 / trailing=只移除末尾 / all=移除全文所有 trash_punc 字元
+    # 預設 trailing 以相容舊 config（舊版只做末尾移除）
+    punc_strip_mode: str = "trailing"
 
 
 @dataclass(frozen=True)
@@ -388,17 +394,43 @@ class ConfigManager:
     @classmethod
     def save(cls, config: AppConfig) -> None:
         """
-        保存配置到 JSON 文件。
+        原子化保存配置到 JSON 文件。
+
+        先寫臨時檔（同目錄）→ flush+fsync → os.replace 原子置換，確保進程
+        中途被硬殺 / crash / 斷電時，要麼完整寫入、要麼原 config.json 不變，
+        絕不留半截 JSON 導致下次載入失敗 fallback 預設、靜默遺失設定（含 API Key）。
+        置換前另存一份 .bak 滾動備份作多一重保險。
 
         Args:
             config: 要保存的 AppConfig 實例
         """
         cls.CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         data = _config_to_dict(config)
-        cls.CONFIG_FILE.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2),
-            encoding="utf-8",
+        payload = json.dumps(data, ensure_ascii=False, indent=2)
+
+        tmp_fd, tmp_path = tempfile.mkstemp(
+            prefix=".config_", suffix=".tmp", dir=str(cls.CONFIG_DIR)
         )
+        try:
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+                f.write(payload)
+                f.flush()
+                os.fsync(f.fileno())
+            # 置換前保留上次良好副本（容錯：備份失敗不影響主流程，但記 log 以便排查）
+            if cls.CONFIG_FILE.exists():
+                try:
+                    shutil.copy2(str(cls.CONFIG_FILE), str(cls.CONFIG_FILE) + ".bak")
+                except Exception as bak_err:
+                    logger.warning("備份舊 config 失敗（不影響保存）: %s", bak_err)
+            os.replace(tmp_path, str(cls.CONFIG_FILE))  # 同卷原子置換
+        except Exception:
+            # 失敗則清掉臨時檔；原 config.json 因尚未 replace 而保持不變
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception as cleanup_err:
+                logger.warning("清理臨時 config 檔失敗: %s", cleanup_err)
+            raise
         logger.info("配置已保存: %s", cls.CONFIG_FILE)
 
     @classmethod

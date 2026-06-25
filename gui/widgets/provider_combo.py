@@ -13,7 +13,8 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Tuple
+from collections.abc import Iterable
+from typing import Any
 
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import QComboBox
@@ -21,6 +22,30 @@ from PySide6.QtWidgets import QComboBox
 from utils.logger import get_logger
 
 logger = get_logger("provider_combo")
+
+# 預設只顯示這些供應商（其餘隱藏但 config／key 保留，可逆）。
+# 空集合 = 顯示全部。日後想加回供應商，改這裡即可。
+VISIBLE_PROVIDERS: frozenset[str] = frozenset({"google", "siliconflow"})
+
+
+def visible_provider_entries(
+    providers: dict[str, dict[str, Any]],
+    whitelist: frozenset[str] = VISIBLE_PROVIDERS,
+    always_include: Iterable[str] = (),
+) -> list[tuple[str, str]]:
+    """回傳 (key, display_name) 清單，只保留白名單內供應商（保持 config 原順序）。
+
+    always_include 內的 key（如目前 active_provider）即使不在白名單也會保留，
+    避免白名單把使用中的供應商隱藏掉。whitelist 為空時顯示全部（軟性閘門）。
+    純函數，可獨立單元測試。
+    """
+    keep = {k for k in always_include if k}
+    out: list[tuple[str, str]] = []
+    for key, info in providers.items():
+        if whitelist and key not in whitelist and key not in keep:
+            continue
+        out.append((key, info.get("name", key)))
+    return out
 
 
 class ProviderCombo(QComboBox):
@@ -37,14 +62,17 @@ class ProviderCombo(QComboBox):
 
     def __init__(
         self,
-        providers: Dict[str, Dict[str, Any]],
+        providers: dict[str, dict[str, Any]],
         parent=None,  # noqa: ANN001
     ) -> None:
         super().__init__(parent)
 
+        # 保留完整 providers，供 set_provider_key 對白名單外但真實存在的
+        # 供應商（如使用中的 active_provider）按需加回，避免靜默改 active
+        self._providers: dict[str, dict[str, Any]] = dict(providers)
         # 保存 (key, display_name) 的有序列表
-        self._entries: List[Tuple[str, str]] = []
-        self._key_to_index: Dict[str, int] = {}
+        self._entries: list[tuple[str, str]] = []
+        self._key_to_index: dict[str, int] = {}
 
         self._populate(providers)
 
@@ -79,6 +107,14 @@ class ProviderCombo(QComboBox):
             key: 服務商 key，例如 ``"openai"``
         """
         idx = self._key_to_index.get(key)
+        if idx is None and key in self._providers:
+            # 白名單外但真實存在（如使用中的 active_provider）→ 動態加回，
+            # 避免回退到第一項令 get_provider_key() 在 Save 時靜默改寫 active
+            display = self._providers[key].get("name", key)
+            idx = len(self._entries)
+            self._entries.append((key, display))
+            self._key_to_index[key] = idx
+            self.addItem(display)
         if idx is not None:
             self.setCurrentIndex(idx)
         else:
@@ -94,8 +130,7 @@ class ProviderCombo(QComboBox):
         self._entries.clear()
         self._key_to_index.clear()
 
-        for idx, (key, info) in enumerate(providers.items()):
-            display = info.get("name", key)
+        for idx, (key, display) in enumerate(visible_provider_entries(providers)):
             self._entries.append((key, display))
             self._key_to_index[key] = idx
             self.addItem(display)

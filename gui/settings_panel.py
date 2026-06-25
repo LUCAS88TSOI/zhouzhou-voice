@@ -40,7 +40,8 @@ from core.recording_db import RecordingDatabase
 from gui.widgets.asr_tab import ASRModelTab
 from gui.widgets.history_tab import HistoryTab
 from gui.widgets.hotword_tab import HotwordTab
-from gui.widgets.provider_combo import ProviderCombo
+from gui.widgets.llm_benchmark_dialog import LlmBenchmarkDialog
+from gui.widgets.provider_combo import ProviderCombo, visible_provider_entries
 from gui.widgets.role_tab import RoleTab
 from gui.widgets.shortcut_input import ShortcutInput
 from utils.config import (
@@ -88,6 +89,8 @@ class SettingsPanel(QWidget):
         self._current_provider_key: str = ""
         # 各 provider 的置頂模型（編輯中暫存，儲存時寫回 config）
         self._pinned_store: Dict[str, list[str]] = {}
+        # 各 provider 的批量測速選取模型（編輯中暫存，儲存時寫回 config）
+        self._benchmark_store: Dict[str, list[str]] = {}
         # 正在背景抓取模型清單的 provider（防重複觸發）
         self._fetching_models: set[str] = set()
         self._models_fetched.connect(self._on_models_fetched)
@@ -214,6 +217,11 @@ class SettingsPanel(QWidget):
             format_num=self._format_num_check.isChecked(),
             format_spell=self._format_spell_check.isChecked(),
             trash_punc=self._trash_punc_input.text(),
+            punc_strip_mode=(
+                self._punc_scope_combo.currentData()
+                if self._punc_strip_check.isChecked()
+                else "off"
+            ),
         )
 
         new_asr = ASRConfig(
@@ -347,6 +355,15 @@ class SettingsPanel(QWidget):
         self._test_result_label = QLabel("")
         self._test_result_label.setWordWrap(True)
         self._test_result_label.setStyleSheet("font-size: 11px;")
+        # 第三方回應片段可能含 HTML，強制純文字渲染避免 Qt 當 rich-text 處理
+        self._test_result_label.setTextFormat(Qt.TextFormat.PlainText)
+
+        self._benchmark_btn = QPushButton("批量測速")
+        self._benchmark_btn.setFixedWidth(80)
+        self._benchmark_btn.setToolTip(
+            "勾選多個模型，一鍵批量測試回應速度，按最快排序並可一鍵套用"
+        )
+        self._benchmark_btn.clicked.connect(self._on_benchmark_clicked)
 
         self._reset_provider_btn = QPushButton("重置")
         self._reset_provider_btn.setFixedWidth(60)
@@ -355,6 +372,7 @@ class SettingsPanel(QWidget):
 
         test_row = QHBoxLayout()
         test_row.addWidget(self._test_btn)
+        test_row.addWidget(self._benchmark_btn)
         test_row.addWidget(self._reset_provider_btn)
         test_row.addWidget(self._test_result_label, stretch=1)
         provider_form.addRow(test_row)
@@ -412,8 +430,12 @@ class SettingsPanel(QWidget):
         # 使用普通 QComboBox 來正確處理「與主服務商相同」選項
         self._repolish_provider_combo = QComboBox()
         self._repolish_provider_combo.addItem("與主服務商相同", "")
-        for pkey, pinfo in self._config.llm.providers.items():
-            self._repolish_provider_combo.addItem(pinfo.get("name", pkey), pkey)
+        # always_include：已設定的 repolish_provider 即使白名單外也要顯示，避免 Save 靜默清空
+        for pkey, pname in visible_provider_entries(
+            self._config.llm.providers,
+            always_include=(self._config.llm.repolish_provider,),
+        ):
+            self._repolish_provider_combo.addItem(pname, pkey)
         self._repolish_provider_combo.currentIndexChanged.connect(self._on_repolish_provider_index_changed)
         repolish_form.addRow("服務商：", self._repolish_provider_combo)
 
@@ -482,9 +504,26 @@ class SettingsPanel(QWidget):
         self._format_spell_check = QCheckBox("英文拼寫格式化")
         form.addRow(self._format_spell_check)
 
+        self._punc_strip_check = QCheckBox("移除標點符號")
+        self._punc_strip_check.setToolTip("關閉時保留所有標點；開啟後依下方範圍移除自訂標點。")
+        form.addRow(self._punc_strip_check)
+
+        self._punc_scope_combo = QComboBox()
+        self._punc_scope_combo.addItem("僅末尾", "trailing")
+        self._punc_scope_combo.addItem("全文", "all")
+        self._punc_scope_combo.setToolTip(
+            "僅末尾：只去掉句尾標點（如「你好，」→「你好」）。\n"
+            "全文：去掉文字中所有自訂標點（連句中逗號都移除）。"
+        )
+        form.addRow("移除範圍：", self._punc_scope_combo)
+
         self._trash_punc_input = QLineEdit()
         self._trash_punc_input.setPlaceholderText("要移除的標點符號")
-        form.addRow("移除標點：", self._trash_punc_input)
+        form.addRow("標點字元：", self._trash_punc_input)
+
+        # 未勾選「移除標點符號」時，範圍與字元設定灰掉
+        self._punc_strip_check.toggled.connect(self._punc_scope_combo.setEnabled)
+        self._punc_strip_check.toggled.connect(self._trash_punc_input.setEnabled)
 
         return page
 
@@ -586,6 +625,11 @@ class SettingsPanel(QWidget):
             pk: list(pv.get("pinned_models", []))
             for pk, pv in llm.providers.items()
         }
+        # 重建批量測速選取快取（各 provider 獨立，容錯讀取；非 list 視為空）
+        self._benchmark_store = {
+            pk: list(bm) if isinstance(bm := pv.get("benchmark_models"), list) else []
+            for pk, pv in llm.providers.items()
+        }
         self._llm_enabled_check.setChecked(llm.enabled)
 
         # 阻塞信號，防止觸發 _on_provider_changed 把空值寫入快取
@@ -644,6 +688,16 @@ class SettingsPanel(QWidget):
         self._format_num_check.setChecked(out.format_num)
         self._format_spell_check.setChecked(out.format_spell)
         self._trash_punc_input.setText(out.trash_punc)
+
+        strip_on = out.punc_strip_mode != "off"
+        self._punc_strip_check.setChecked(strip_on)
+        scope = out.punc_strip_mode if strip_on else "trailing"
+        scope_idx = self._punc_scope_combo.findData(scope)
+        if scope_idx >= 0:
+            self._punc_scope_combo.setCurrentIndex(scope_idx)
+        # 初始 enable 狀態（toggled 信號只在變更時觸發，故顯式設定）
+        self._punc_scope_combo.setEnabled(strip_on)
+        self._trash_punc_input.setEnabled(strip_on)
 
         # 熱詞頁籤
         self._tab_hotword.load_config(config.hotword)
@@ -893,6 +947,11 @@ class SettingsPanel(QWidget):
             if pkey in providers:
                 providers[pkey]["pinned_models"] = list(pinned)
 
+        # 寫回各 provider 的批量測速選取模型
+        for pkey, bench in self._benchmark_store.items():
+            if pkey in providers:
+                providers[pkey]["benchmark_models"] = list(bench)
+
         return providers
 
     # ─────────────────────────────────────────────
@@ -985,17 +1044,12 @@ class SettingsPanel(QWidget):
                 enabled=True,
             )
             client = LLMClient(provider, timeout=10)
-            success, message = client.test_connection(timeout=10)
+            success, message, elapsed = client.test_connection(timeout=10)
 
-            if success:
-                self._test_result_label.setStyleSheet(
-                    "font-size: 11px; color: #4CAF50;"
-                )
-            else:
-                self._test_result_label.setStyleSheet(
-                    "font-size: 11px; color: #d32f2f;"
-                )
-            self._test_result_label.setText(message)
+            secs = f"{'⚡' if success else '⏱'} {elapsed:.2f} 秒"
+            color = "#4CAF50" if success else "#d32f2f"
+            self._test_result_label.setStyleSheet(f"font-size: 11px; color: {color};")
+            self._test_result_label.setText(f"{secs}｜{message}")
 
         except Exception as err:
             self._test_result_label.setStyleSheet(
@@ -1004,6 +1058,44 @@ class SettingsPanel(QWidget):
             self._test_result_label.setText(f"測試異常：{err}")
         finally:
             self._test_btn.setEnabled(True)
+
+    def _on_benchmark_clicked(self) -> None:
+        """打開批量測速對話框：勾選模型 → 批量測試 → 按最快排序。"""
+        provider_key = self._provider_combo.get_provider_key()
+        api_url = self._api_url_input.text().strip()
+        api_key = self._api_key_input.text().strip()
+
+        if not api_key or not api_url:
+            self._test_result_label.setStyleSheet("font-size: 11px; color: #d32f2f;")
+            self._test_result_label.setText("請先填 API URL 與 API Key")
+            return
+
+        # 候選模型 = 當前下拉的全部項（排除置頂分隔線的空字串）
+        candidates = [
+            t for i in range(self._model_input.count())
+            if (t := self._model_input.itemText(i).strip())
+        ]
+        if not candidates:
+            self._test_result_label.setStyleSheet("font-size: 11px; color: #d32f2f;")
+            self._test_result_label.setText("沒有可測試的模型")
+            return
+
+        dialog = LlmBenchmarkDialog(
+            provider_key=provider_key,
+            api_url=api_url,
+            api_key=api_key,
+            candidate_models=candidates,
+            preselected=self._benchmark_store.get(provider_key, []),
+            parent=self,
+        )
+        accepted = dialog.exec()
+        # 記住用戶的勾選（即使關閉也保存，下次自動還原）
+        self._benchmark_store[provider_key] = dialog.selected_models
+        # 套用最快：回填到模型下拉
+        if accepted and dialog.chosen_model:
+            self._model_input.setCurrentText(dialog.chosen_model)
+            self._test_result_label.setStyleSheet("font-size: 11px; color: #4CAF50;")
+            self._test_result_label.setText(f"已套用最快模型：{dialog.chosen_model}")
 
     # ─────────────────────────────────────────────
     #  API Key 顯示 / 隱藏

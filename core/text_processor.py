@@ -49,6 +49,13 @@ def strip_trailing_punc(text: str, chars: str = "，。,.") -> str:
     return text.rstrip(chars)
 
 
+def strip_all_punc(text: str, chars: str = "，。,.") -> str:
+    """移除全文中所有出現的指定標點符號。"""
+    if not chars:
+        return text
+    return text.translate({ord(c): None for c in chars})
+
+
 # ═══════════════════════════════════════════════════════════
 # 中文數字 → 阿拉伯數字（ITN）
 # ═══════════════════════════════════════════════════════════
@@ -328,7 +335,12 @@ class TextProcessor:
             text = chinese_to_number(text)
 
         if self._config.trash_punc:
-            text = strip_trailing_punc(text, self._config.trash_punc)
+            mode = self._config.punc_strip_mode
+            if mode == "trailing":
+                text = strip_trailing_punc(text, self._config.trash_punc)
+            elif mode == "all":
+                text = strip_all_punc(text, self._config.trash_punc)
+            # mode == "off"：不移除任何標點
 
         if self._config.traditional_convert:
             text = to_traditional(text, self._config.traditional_locale)

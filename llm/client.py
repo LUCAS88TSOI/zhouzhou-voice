@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import socket
+import time
 from collections.abc import Generator
 from dataclasses import dataclass
 from typing import Any
@@ -428,12 +429,17 @@ class LLMClient:
             logger.error("回應解析失敗: %s", err)
             return ""
 
-    def test_connection(self, timeout: int = 10) -> tuple[bool, str]:
+    def test_connection(self, timeout: int = 10) -> tuple[bool, str, float]:
         """
         Send a minimal request to verify the API key and endpoint work.
 
+        量度由送出請求到收到回應（或失敗）的實際往返耗時，供 UI 顯示，
+        讓用戶比較不同模型／供應商，揀出回應最快那個。
+
         Returns:
-            (success, message) — human-readable result for the UI.
+            (success, message, elapsed) — message 為人類可讀結果；
+            elapsed 為網絡往返秒數（float）。失敗或逾時亦回報直到該刻為止
+            的耗時，方便對比「邊個端點慢」。
         """
         request = ChatRequest(
             messages=({"role": "user", "content": "Hi"},),
@@ -449,6 +455,7 @@ class LLMClient:
         }
         payload = json.dumps(request.to_payload()).encode("utf-8")
 
+        start = time.perf_counter()
         try:
             response = _POOL_MANAGER.urlopen(
                 "POST",
@@ -459,33 +466,45 @@ class LLMClient:
                 timeout=urllib3.Timeout(connect=10, read=timeout),
             )
         except urllib3.exceptions.HTTPError as err:
-            return False, f"連線失敗：{err}"
+            elapsed = time.perf_counter() - start
+            return False, f"連線失敗：{err}", elapsed
         except (socket.timeout, TimeoutError):
-            return False, f"連線超時（{timeout} 秒）：請檢查網路或 API URL"
+            elapsed = time.perf_counter() - start
+            return False, f"連線超時（{timeout} 秒）：請檢查網路或 API URL", elapsed
 
+        elapsed = time.perf_counter() - start
         body = response.data.decode("utf-8", errors="replace")
         # 防止 API 回應中意外洩露 API Key
         body = body.replace(self._provider.api_key, "[REDACTED]")
 
-        if response.status == 401:
-            return False, f"API Key 無效（HTTP 401）：{body[:120]}"
-        if response.status == 403:
-            return False, f"權限不足（HTTP 403）：{body[:120]}"
-        if response.status == 404:
-            return False, "端點不存在（HTTP 404）：確認 API URL 是否正確"
-        if response.status == 429:
-            return False, "請求過於頻繁（HTTP 429）：請稍後重試"
+        # 4xx：回應 body 由第三方端點控制，可能含 PII 或截斷／變形的 key，
+        # 故只寫入（已 redact 的）log 供 debug，UI 一律用固定文案，避免敏感資料外洩。
         if response.status != 200:
-            return False, f"HTTP {response.status} 錯誤：{body[:120]}"
+            logger.warning("測試連接失敗 HTTP %d: %s", response.status, body[:200])
+        if response.status == 401:
+            return False, "API Key 無效（HTTP 401）", elapsed
+        if response.status == 403:
+            return False, "權限不足（HTTP 403）", elapsed
+        if response.status == 404:
+            return False, "端點不存在（HTTP 404）：確認 API URL 是否正確", elapsed
+        if response.status == 429:
+            return False, "請求過於頻繁（HTTP 429）：請稍後重試", elapsed
+        if response.status != 200:
+            return False, f"HTTP {response.status} 錯誤（詳見日誌）", elapsed
 
         try:
             parsed = self._parse_sync_response(response)
             reply_preview = (
                 parsed.content[:50] if parsed.content else "(空回覆)"
             )
-            return True, f"連接成功！模型回應：{reply_preview}"
+            # 成功回覆內容亦來自第三方，異常端點下可能含 key，一併 redact 再上 UI
+            if self._provider.api_key:
+                reply_preview = reply_preview.replace(
+                    self._provider.api_key, "[REDACTED]"
+                )
+            return True, f"連接成功！模型回應：{reply_preview}", elapsed
         except Exception as err:
-            return False, f"回應解析失敗：{err}"
+            return False, f"回應解析失敗：{err}", elapsed
 
     # ─── 內部方法 ──────────────────────────────────────────
 
