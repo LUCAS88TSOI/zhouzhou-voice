@@ -58,12 +58,20 @@ class VoiceApp:
     - 協調模組間的交互
     """
 
+    # 錄音裝置不可用時的重試/通知節流間隔（秒）
+    _RECORDER_RETRY_INTERVAL = 3.0
+    _NO_MIC_HINT = "未偵測到麥克風，請接上裝置或在 Windows 聲音設定選擇輸入裝置"
+
     def __init__(self) -> None:
         self._config: AppConfig | None = None
         self._lifecycle = LifecycleManager()
 
         # Phase 2: ASR 核心
         self._recorder = None       # AudioRecorder
+        # 錄音器初始化失敗原因（None = 正常）。無預設輸入裝置時 PortAudio 會拋
+        # "Error querying device -1"，記下來供 UI 提示，避免按鍵時靜默無反應。
+        self._recorder_error: str | None = None
+        self._recorder_retry_time: float = 0.0
         self._asr_process = None    # ASRProcess
         self._text_processor = None # TextProcessor
 
@@ -121,11 +129,31 @@ class VoiceApp:
         return self._lifecycle
 
     def update_indicator_position(self, x: int, y: int) -> None:
-        """更新錄音指示器位置並儲存（不重啟任何服務）。"""
-        new_ui = replace(self._config.ui, indicator_x=x, indicator_y=y)
+        """浮窗被拖動 → 記錄自訂位置並儲存（不重啟任何服務）。
+
+        拖動代表用戶明確指定位置，故同時關閉 indicator_auto_center，
+        否則下次顯示又會跳回底部中央。
+        """
+        new_ui = replace(
+            self._config.ui, indicator_x=x, indicator_y=y, indicator_auto_center=False,
+        )
         self._config = replace(self._config, ui=new_ui)
         ConfigManager.save(self._config)
         logger.debug("指示器位置已更新: (%d, %d)", x, y)
+
+    def reset_indicator_position(self, notify_gui: bool = True) -> None:
+        """清除自訂位置 → 回到自動貼齊游標所在螢幕底部中央。
+
+        Args:
+            notify_gui: 是否命令浮窗即時歸位。浮窗自我修復那條路徑傳 False ——
+                widget 早已自行歸位，重複下令只會多一次 queued move。
+        """
+        new_ui = replace(self._config.ui, indicator_auto_center=True)
+        self._config = replace(self._config, ui=new_ui)
+        ConfigManager.save(self._config)
+        if notify_gui:
+            self._invoke_gui("reset_recording_indicator")
+        logger.info("指示器位置已重置為自動底部中央")
 
     # ─── 啟動與關閉 ────────────────────────────────────────
 
@@ -134,6 +162,11 @@ class VoiceApp:
         try:
             self._initialize()
             self._print_banner()
+
+            # 錄音器起不來時開機就提示，不用等使用者按半天快捷鍵才發現
+            if self._recorder is None or not self._recorder.is_open:
+                self._invoke_gui("notify_warning", (str, self._NO_MIC_HINT))
+                self._invoke_gui("set_status", (str, "未偵測到麥克風"))
 
             # 有 GUI 時進入 Qt 事件循環，否則用等待循環
             if self._qt_app is not None:
@@ -209,17 +242,67 @@ class VoiceApp:
             logger.error("錄音歷史資料庫初始化失敗: %s", err, exc_info=True)
 
     def _init_recorder(self) -> None:
-        """初始化錄音模組。"""
+        """初始化（或重建）錄音模組。失敗時保留原因供 UI 提示（不可靜默）。
+
+        重建前先回收舊錄音器：熱插拔多次時舊的 PortAudio stream 會一直佔著
+        裝置，累積的 shutdown 回調也會愈積愈多。
+        """
+        self._close_recorder()
         try:
-            from core.audio_recorder import AudioRecorder
+            import core.audio_recorder as ar_mod
             max_dur = float(self._config.audio.max_recording_seconds)
-            self._recorder = AudioRecorder(max_duration=max_dur)
-            self._recorder.set_limit_callback(self._on_recording_limit_reached)
-            self._recorder.open()
-            self._lifecycle.register_shutdown(self._recorder.close)
+            recorder = ar_mod.AudioRecorder(max_duration=max_dur)
+            recorder.set_limit_callback(self._on_recording_limit_reached)
+            recorder.open()
+            self._recorder = recorder
+            self._recorder_error = None
+            self._lifecycle.register_shutdown(self._close_recorder)
             logger.info("錄音模組就緒（上限 %.0f 秒）", max_dur)
         except Exception as err:
+            self._recorder = None
+            self._recorder_error = str(err)
             logger.error("錄音模組初始化失敗: %s", err)
+
+    def _close_recorder(self) -> None:
+        """關閉目前錄音器並解除其 shutdown 註冊（重建與關機共用）。"""
+        recorder, self._recorder = self._recorder, None
+        if recorder is None:
+            return
+        self._lifecycle.unregister_shutdown(self._close_recorder)
+        try:
+            recorder.close()
+        except Exception as err:
+            logger.warning("關閉舊錄音器失敗: %s", err)
+
+    def _ensure_recorder(self) -> bool:
+        """確保錄音器可用，不可用時嘗試重建。
+
+        支援麥克風熱插拔：使用者插上麥克風或在系統設定選好輸入裝置後，
+        下次按快捷鍵即可錄音，不需重啟程式。
+
+        重試與通知都受 ``_RECORDER_RETRY_INTERVAL`` 節流：查詢音訊裝置會阻塞
+        呼叫端（pynput 鍵盤線程），狂按快捷鍵時不可每次都 probe，托盤氣泡也
+        不可刷屏。
+
+        Returns:
+            True 表示錄音器已就緒可錄音。
+        """
+        if self._recorder is not None and self._recorder.is_open:
+            return True
+
+        now = time.monotonic()
+        if now - self._recorder_retry_time < self._RECORDER_RETRY_INTERVAL:
+            return False
+        self._recorder_retry_time = now
+
+        self._init_recorder()
+        if self._recorder is not None and self._recorder.is_open:
+            logger.info("錄音裝置已恢復，錄音器重建成功")
+            return True
+
+        logger.warning("錄音裝置不可用: %s", self._recorder_error or "無預設輸入裝置")
+        self._invoke_gui("notify_warning", (str, self._NO_MIC_HINT))
+        return False
 
     def _on_recording_limit_reached(self) -> None:
         """錄音達到 max_recording_seconds 上限時的回調（在音頻線程中觸發）。
@@ -485,9 +568,14 @@ class VoiceApp:
 
     def _show_mic_test(self) -> None:
         """顯示麥克風測試對話框（首次啟動或手動觸發）。"""
+        # 對話框內部直接呼叫 recorder，沒有 None guard：錄音器不可用時
+        # 先提示再返回，避免點下去拋 AttributeError。
+        if not self._ensure_recorder():
+            self._invoke_gui("notify_warning", (str, self._NO_MIC_HINT))
+            return
         try:
-            from gui.mic_test_dialog import MicTestDialog
-            dlg = MicTestDialog(self._recorder, self._asr_process, parent=None)
+            import gui.mic_test_dialog as dlg_mod
+            dlg = dlg_mod.MicTestDialog(self._recorder, self._asr_process, parent=None)
             dlg.exec()
             # 標記已完成首次設定
             if not self._config.setup_complete:
@@ -710,8 +798,13 @@ class VoiceApp:
             logger.error("重新處理異常: %s", err, exc_info=True)
 
     def _on_recording_start(self) -> None:
-        """快捷鍵長按觸發：開始錄音。"""
-        if self._recorder is None:
+        """快捷鍵長按觸發：開始錄音。
+
+        錄音器不可用時給出明確 UI 反饋（狀態列 + 托盤氣泡），
+        不可靜默 return——否則使用者只會看到「按了沒反應」。
+        """
+        if not self._ensure_recorder():
+            self._invoke_gui("set_status", (str, "未偵測到麥克風"))
             return
         self._recorder.start_recording()
         logger.info("錄音開始")
@@ -1577,6 +1670,11 @@ class VoiceApp:
                 old_config.llm.builtin_overrides != new_config.llm.builtin_overrides:
             self._refresh_tray_roles()
             logger.info("角色已切換: %s", new_config.llm.active_role)
+
+        # 8. 桌面浮窗顯示開關變更 → 即時重建（不需重啟程式）
+        if old_config.ui.show_indicator != new_config.ui.show_indicator:
+            self._invoke_gui("rebuild_recording_indicator")
+            logger.info("桌面浮窗顯示設定已變更: %s", new_config.ui.show_indicator)
 
     def _apply_config_recreate_asr(self, new_config: AppConfig) -> bool:
         """ASR 模型切換時，stop 舊進程 + _init_asr() 建新進程。

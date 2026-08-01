@@ -203,10 +203,31 @@ class FileConfig:
 
 @dataclass(frozen=True)
 class UIConfig:
-    """UI 偏好設定"""
+    """UI 偏好設定
+
+    indicator_auto_center=True 時忽略 indicator_x/y，每次顯示浮窗都自動貼齊
+    「游標所在螢幕」的底部中央。用布林旗標而非數值 sentinel（如 -1）表達模式，
+    因為多螢幕虛擬桌面下負座標是完全合法的（副屏排在主屏左邊 / 上邊）。
+    """
     indicator_x: int = 100
     indicator_y: int = 100
+    indicator_auto_center: bool = True
     show_indicator: bool = True
+
+    def __post_init__(self) -> None:
+        # frozen=True 下必須用 object.__setattr__ 繞過 setattr 限制。
+        # config.json 被手改壞（如 "indicator_x": "abc"）時，壞座標會令
+        # RecordingIndicator 的 move() 拋 TypeError 被 except 吞掉 → 浮窗永久
+        # 靜默停用，屬與「螢幕空隙座標」同類的無聲失效，故一併堵上。
+        for name, default in (("indicator_x", 100), ("indicator_y", 100)):
+            try:
+                object.__setattr__(self, name, int(getattr(self, name)))
+            except (TypeError, ValueError):
+                object.__setattr__(self, name, default)
+        for name in ("indicator_auto_center", "show_indicator"):
+            val = getattr(self, name)
+            if not isinstance(val, bool):
+                object.__setattr__(self, name, True if val is None else bool(val))
 
 
 @dataclass(frozen=True)
@@ -350,6 +371,34 @@ def _dict_to_config(data: Dict[str, Any]) -> AppConfig:
 def _config_to_dict(config: AppConfig) -> Dict[str, Any]:
     """將 AppConfig 轉換為可 JSON 序列化的字典。"""
     return asdict(config)
+
+
+# ─── 公開工具函數 ──────────────────────────────────────────
+
+def merge_live_indicator_position(snapshot: AppConfig, live: AppConfig) -> AppConfig:
+    """把 live 的浮窗座標與定位模式（僅 indicator_x/y/auto_center 三欄）蓋回設定頁快照。
+
+    浮窗位置由 VoiceApp 擁有：拖動浮窗、按「重置到底部中央」都會即時寫入
+    config。而 SettingsPanel 持有的是「開啟設定頁那一刻」的快照，若直接提交，
+    「按重置按鈕 → 再按儲存」會令剛剛的重置被過期快照靜默覆蓋。
+    設定頁仍然擁有 show_indicator 開關，故只蓋座標與模式三個欄位。
+
+    唯一呼叫點是 `MainWindow._on_settings_save`（亦是 `settings_save_requested`
+    的唯一 emit 點）。若日後新增其他提交路徑，必須同樣經過本函數。
+
+    Args:
+        snapshot: 設定頁產生的新配置（可能帶過期的 ui 座標）
+        live: 目前生效的配置（座標的唯一真相來源）
+
+    Returns:
+        座標已校正的新 AppConfig
+    """
+    return replace(snapshot, ui=replace(
+        snapshot.ui,
+        indicator_x=live.ui.indicator_x,
+        indicator_y=live.ui.indicator_y,
+        indicator_auto_center=live.ui.indicator_auto_center,
+    ))
 
 
 # ─── 配置管理器 ────────────────────────────────────────────

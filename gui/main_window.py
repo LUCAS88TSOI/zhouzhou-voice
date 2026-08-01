@@ -35,10 +35,12 @@ from PySide6.QtWidgets import (
 )
 
 from gui.tray_icon import VoiceTrayIcon
+from utils.config import merge_live_indicator_position
 from utils.logger import get_logger
 
 if TYPE_CHECKING:
     from app.app import VoiceApp
+    from gui.recording_indicator import RecordingIndicator
 
 logger = get_logger("main_window")
 
@@ -150,8 +152,13 @@ class MainWindow(QMainWindow):
 
         # 桌面錄音指示器
         self._recording_indicator = self._create_recording_indicator()
-        # 浮窗「完成態」延遲隱藏定時器（重複狀態變更時自動取消）
-        self._indicator_hide_timer: Optional[QTimer] = None
+        # 浮窗「完成態」延遲隱藏定時器（重複狀態變更時自動取消）。
+        # 單例重用：舊實作每次「完成」都 new 一個 QTimer(self)，Python 端置 None
+        # 後 C++ 物件仍掛在 MainWindow 下，托盤常駐一日會累積幾百個 QObject。
+        # timeout 接 MainWindow 的 slot 而非 widget 的方法，浮窗重建亦不會失效。
+        self._indicator_hide_timer = QTimer(self)
+        self._indicator_hide_timer.setSingleShot(True)
+        self._indicator_hide_timer.timeout.connect(self._hide_recording_indicator)
         # 進度條批次結束後的單一可取消隱藏定時器
         # （先前 QTimer.singleShot 不可取消，會在下一個檔案還在跑時誤藏）
         self._progress_hide_timer: Optional[QTimer] = None
@@ -199,13 +206,13 @@ class MainWindow(QMainWindow):
         Args:
             status: 狀態描述（如 STATUS_READY、STATUS_RECORDING 等）
         """
-        self._current_status = status
+        prev, self._current_status = self._current_status, status
         self._status_label.setText(f"  {status}")
         self._tray.update_status(status)
 
         # 桌面錄音指示器：整流程持續顯示，依狀態切換顏色與文字
         if self._recording_indicator is not None:
-            self._sync_indicator_state(status)
+            self._sync_indicator_state(status, prev)
 
         logger.debug("狀態更新: %s", status)
 
@@ -216,8 +223,14 @@ class MainWindow(QMainWindow):
             self._tray.show_message("CC語音", message)
         logger.warning("用戶提示: %s", message)
 
-    def _sync_indicator_state(self, status: str) -> None:
+    def _sync_indicator_state(self, status: str, prev: str = "") -> None:
         """根據主視窗狀態同步浮窗顏色與文字。
+
+        Args:
+            status: 新狀態
+            prev: 上一個狀態。由空閒 / 完成 / 失敗進入流程狀態代表「新流程起點」，
+                需強制重新定位到游標所在螢幕 —— 「完成」後浮窗有 800ms 延遲隱藏，
+                期間開始新錄音時浮窗仍可見，不強制重算就會留在上一塊螢幕。
 
         語義：
           STATUS_DONE    → 綠色「完成」短暫顯示後隱藏
@@ -232,18 +245,11 @@ class MainWindow(QMainWindow):
         )
 
         # 取消任何待執行的隱藏定時器（避免新狀態被舊定時器擦掉）
-        if self._indicator_hide_timer is not None:
-            self._indicator_hide_timer.stop()
-            self._indicator_hide_timer = None
+        self._cancel_indicator_hide_timer()
 
         if status == STATUS_DONE:
             self._recording_indicator.set_state(STATE_DONE, "完成")
             self._recording_indicator.show_recording()
-            self._indicator_hide_timer = QTimer(self)
-            self._indicator_hide_timer.setSingleShot(True)
-            self._indicator_hide_timer.timeout.connect(
-                self._recording_indicator.hide_recording
-            )
             self._indicator_hide_timer.start(_DONE_HIDE_DELAY_MS)
             return
 
@@ -263,17 +269,41 @@ class MainWindow(QMainWindow):
             self._recording_indicator.hide_recording()
             return
 
-        self._recording_indicator.show_recording()
+        self._recording_indicator.show_recording(
+            force_reposition=prev in (STATUS_READY, STATUS_DONE, STATUS_FAILED, ""),
+        )
 
-    def _create_recording_indicator(self):
-        """建立桌面錄音指示器，讀取 config 中儲存的位置。失敗時靜默返回 None。"""
+    def _cancel_indicator_hide_timer(self) -> None:
+        """停掉待執行的浮窗隱藏定時器（避免新狀態被舊定時器擦掉）。"""
+        self._indicator_hide_timer.stop()
+
+    @Slot()
+    def _hide_recording_indicator(self) -> None:
+        """完成態延遲隱藏定時器的接收端（浮窗可能已被重建或關閉）。"""
+        if self._recording_indicator is not None:
+            self._recording_indicator.hide_recording()
+
+    def _create_recording_indicator(self) -> RecordingIndicator | None:
+        """建立桌面錄音指示器。
+
+        show_indicator 關閉時完全不建立（回 None，_sync_indicator_state 已有
+        None 防護）。位置由 config 的 indicator_auto_center 決定模式：自動則
+        不傳座標，交給 RecordingIndicator 貼齊游標所在螢幕底部中央。
+        建立失敗時靜默回 None —— 浮窗是非關鍵功能，不可拖死語音流程。
+        """
         try:
-            from gui.recording_indicator import RecordingIndicator
             ui_cfg = self._app_controller.config.ui if self._app_controller is not None else None
-            x = ui_cfg.indicator_x if ui_cfg is not None else 100
-            y = ui_cfg.indicator_y if ui_cfg is not None else 100
-            indicator = RecordingIndicator(x=x, y=y)
+            if ui_cfg is not None and not ui_cfg.show_indicator:
+                logger.info("設定已關閉桌面浮窗，不建立指示器")
+                return None
+            from gui.recording_indicator import RecordingIndicator
+            saved = (
+                None if ui_cfg is None or ui_cfg.indicator_auto_center
+                else (ui_cfg.indicator_x, ui_cfg.indicator_y)
+            )
+            indicator = RecordingIndicator(saved_pos=saved)
             indicator.position_changed.connect(self._on_indicator_moved)
+            indicator.auto_center_requested.connect(self._on_indicator_auto_center)
             return indicator
         except Exception as err:
             logger.error("無法建立錄音指示器: %s", err)
@@ -285,6 +315,39 @@ class MainWindow(QMainWindow):
         if self._app_controller is not None:
             self._app_controller.update_indicator_position(x, y)
 
+    @Slot()
+    def _on_indicator_auto_center(self) -> None:
+        """浮窗偵測到自身座標失效並已自我修復 → 只需清掉 config 裡的壞座標。
+
+        不通知 GUI：widget 早已歸位，再排一個 queued 的 move 會在浮窗顯示後
+        才執行並重讀 QCursor.pos()，用戶剛好移動滑鼠就會見到浮窗跳屏。
+        """
+        if self._app_controller is not None:
+            self._app_controller.reset_indicator_position(notify_gui=False)
+
+    @Slot()
+    def _on_indicator_reset_requested(self) -> None:
+        """設定頁「重置浮窗到底部中央」→ 即時歸位並存檔（不等儲存按鈕）。"""
+        if self._app_controller is not None:
+            self._app_controller.reset_indicator_position()
+
+    @Slot()
+    def reset_recording_indicator(self) -> None:
+        """外部（VoiceApp）要求浮窗歸位到底部中央。"""
+        if self._recording_indicator is not None:
+            self._recording_indicator.reset_to_auto_center()
+
+    @Slot()
+    def rebuild_recording_indicator(self) -> None:
+        """show_indicator 設定變更 → 銷毀舊浮窗並依新設定重建（可能為 None）。"""
+        self._cancel_indicator_hide_timer()
+        old, self._recording_indicator = self._recording_indicator, None
+        if old is not None:
+            old.hide_recording()
+            old.deleteLater()
+        self._recording_indicator = self._create_recording_indicator()
+        logger.info("桌面浮窗已重建（啟用=%s）", self._recording_indicator is not None)
+
     def force_close(self) -> None:
         """
         強制關閉視窗（跳過「隱藏到托盤」邏輯）。
@@ -292,6 +355,11 @@ class MainWindow(QMainWindow):
         """
         logger.info("強制關閉主視窗")
         self._force_quit = True
+        # 浮窗是獨立 top-level widget（parent=None，否則會跟主視窗隱藏到托盤），
+        # 不會隨主視窗關閉，錄音途中退出須顯式收掉，避免殘留在桌面
+        self._cancel_indicator_hide_timer()
+        if self._recording_indicator is not None:
+            self._recording_indicator.hide_recording()
         self._tray.hide()
         self.close()
 
@@ -341,6 +409,12 @@ class MainWindow(QMainWindow):
             return
         try:
             new_config = self._settings_panel.get_config()
+            # 設定頁的 ui 座標是「開啟設定頁那一刻」的快照，可能已被拖動 /
+            # 「重置到底部中央」改過 → 以 live config 校正，避免靜默覆蓋
+            if self._app_controller is not None:
+                new_config = merge_live_indicator_position(
+                    new_config, self._app_controller.config,
+                )
             logger.info("設定已儲存，發出 settings_save_requested")
             self.settings_save_requested.emit(new_config)
             self._navigate_to_voice()
@@ -555,6 +629,10 @@ class MainWindow(QMainWindow):
                 )
                 # 轉發麥克風測試信號
                 self._settings_panel.mic_test_requested.connect(self._on_mic_test)
+                # 轉發浮窗歸位請求（即時生效，不等「儲存」）
+                self._settings_panel.indicator_reset_requested.connect(
+                    self._on_indicator_reset_requested
+                )
                 self._settings_panel.setStyleSheet(_SETTINGS_STYLESHEET)
             except Exception as err:
                 logger.error("無法建立 SettingsPanel: %s", err, exc_info=True)

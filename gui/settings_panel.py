@@ -17,7 +17,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, Dict
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QTimer, Signal, Slot
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -62,6 +62,11 @@ PROJECT_URL = "https://github.com/LUCAS88TSOI/zhouzhou-voice"
 DONATE_URL = "https://zhouzhou-voice.vercel.app/#donate"
 PAYME_URL = "https://payme.hsbc/289b982f31514bdfafa7d3e597aa1ab2"
 
+# 浮窗重置按鈕的常態文字與「已生效」回饋（回饋顯示時長，毫秒）
+_RESET_INDICATOR_TEXT = "重置浮窗到底部中央"
+_RESET_INDICATOR_DONE_TEXT = "✓ 已重置，下次錄音顯示在螢幕底部中央"
+_RESET_FEEDBACK_MS = 2500
+
 
 class SettingsPanel(QWidget):
     """
@@ -72,6 +77,9 @@ class SettingsPanel(QWidget):
     """
 
     mic_test_requested = Signal()  # 請求開啟麥克風測試
+    # 請求把桌面浮窗歸位到底部中央。座標由 VoiceApp 擁有（拖動即時寫入），
+    # 故此按鈕不走「儲存」流程，直接即時生效 + 即時存檔。
+    indicator_reset_requested = Signal()
     # 背景抓取模型清單完成：(provider_key, models, error_msg)
     _models_fetched = Signal(str, list, str)
 
@@ -207,6 +215,7 @@ class SettingsPanel(QWidget):
             repolish_provider=self._repolish_provider_combo.currentData() or "",
             repolish_model=self._repolish_model_input.currentText().strip() if self._repolish_provider_combo.currentData() else "",
             repolish_role=self._tab_role.get_repolish_role(),
+            polish_timeout=float(self._polish_timeout_spin.value()),
         )
 
         new_output = OutputConfig(
@@ -239,6 +248,14 @@ class SettingsPanel(QWidget):
 
         new_hotword = self._tab_hotword.get_hotword_config()
 
+        # 只帶 show_indicator；indicator_x/y 與 auto_center 由 VoiceApp 擁有，
+        # 由 MainWindow._on_settings_save 呼叫 utils.config.merge_live_indicator_position()
+        # 以 live 值覆蓋，避免此處的過期快照 clobber 掉拖動 / 重置結果
+        new_ui = replace(
+            self._config.ui,
+            show_indicator=self._show_indicator_check.isChecked(),
+        )
+
         return replace(
             self._config,
             shortcut=new_shortcut,
@@ -248,6 +265,7 @@ class SettingsPanel(QWidget):
             history=new_history,
             hotword=new_hotword,
             file=self._config.file,
+            ui=new_ui,
         )
 
     # ─────────────────────────────────────────────
@@ -394,6 +412,15 @@ class SettingsPanel(QWidget):
         self._max_tokens_spin.setSingleStep(128)
         param_form.addRow("Max Tokens：", self._max_tokens_spin)
 
+        # 逾時上限：夠鐘未回完就丟棄半截潤色、貼 ASR 原文（見 app/app.py）
+        self._polish_timeout_spin = QSpinBox()
+        self._polish_timeout_spin.setRange(3, 120)
+        self._polish_timeout_spin.setSuffix(" 秒")
+        self._polish_timeout_spin.setToolTip(
+            "LLM 潤色最多等幾耐。夠鐘未回完就停止潤色、直接貼未潤色原文。"
+        )
+        param_form.addRow("潤色逾時：", self._polish_timeout_spin)
+
         self._top_p_spin = QDoubleSpinBox()
         self._top_p_spin.setRange(0.0, 1.0)
         self._top_p_spin.setSingleStep(0.05)
@@ -525,7 +552,34 @@ class SettingsPanel(QWidget):
         self._punc_strip_check.toggled.connect(self._punc_scope_combo.setEnabled)
         self._punc_strip_check.toggled.connect(self._trash_punc_input.setEnabled)
 
+        self._show_indicator_check = QCheckBox("錄音時顯示桌面浮窗")
+        self._show_indicator_check.setToolTip(
+            "顯示錄音 / 識別 / 潤色狀態的半透明浮窗。\n"
+            "預設貼齊「滑鼠所在螢幕」的底部中央，可用左鍵拖到任意位置。"
+        )
+        form.addRow(self._show_indicator_check)
+
+        # 位置由 VoiceApp 擁有，此按鈕即時生效而非等「儲存」，故需回饋令用戶
+        # 確認已生效（浮窗當下通常不可見，撳完會完全冇反應）
+        self._indicator_reset_btn = QPushButton(_RESET_INDICATOR_TEXT)
+        self._indicator_reset_btn.setToolTip("清除拖動過的自訂位置（即時生效，不需按儲存）。")
+        self._indicator_reset_btn.clicked.connect(self._on_indicator_reset_clicked)
+        form.addRow(self._indicator_reset_btn)
+
+        self._reset_feedback_timer = QTimer(self)
+        self._reset_feedback_timer.setSingleShot(True)
+        self._reset_feedback_timer.timeout.connect(
+            lambda: self._indicator_reset_btn.setText(_RESET_INDICATOR_TEXT)
+        )
+
         return page
+
+    @Slot()
+    def _on_indicator_reset_clicked(self) -> None:
+        """發出重置請求並短暫改按鈕文字作回饋（單例 timer，重複點擊會續期）。"""
+        self.indicator_reset_requested.emit()
+        self._indicator_reset_btn.setText(_RESET_INDICATOR_DONE_TEXT)
+        self._reset_feedback_timer.start(_RESET_FEEDBACK_MS)
 
     # ─────────────────────────────────────────────
     #  頁籤 4：關於
@@ -640,6 +694,8 @@ class SettingsPanel(QWidget):
         self._current_provider_key = llm.active_provider
         self._temperature_spin.setValue(llm.temperature)
         self._max_tokens_spin.setValue(llm.max_tokens)
+        # 舊 config 的 0（不限制）已不支援，交由 SpinBox 收斂到下限
+        self._polish_timeout_spin.setValue(int(llm.polish_timeout))
         self._top_p_spin.setValue(llm.top_p)
         self._freq_penalty_spin.setValue(llm.frequency_penalty)
         self._pres_penalty_spin.setValue(llm.presence_penalty)
@@ -698,6 +754,9 @@ class SettingsPanel(QWidget):
         # 初始 enable 狀態（toggled 信號只在變更時觸發，故顯式設定）
         self._punc_scope_combo.setEnabled(strip_on)
         self._trash_punc_input.setEnabled(strip_on)
+
+        # 浮窗只讀開關；座標與模式由 VoiceApp 擁有，設定頁不碰
+        self._show_indicator_check.setChecked(config.ui.show_indicator)
 
         # 熱詞頁籤
         self._tab_hotword.load_config(config.hotword)
