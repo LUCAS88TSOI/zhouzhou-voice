@@ -14,11 +14,14 @@ import threading
 import time
 from dataclasses import replace
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from app.lifecycle import LifecycleManager
 from utils.config import AppConfig, ConfigManager
 from utils.logger import get_logger, setup_logging
+
+if TYPE_CHECKING:
+    from llm.processor import LLMProcessor
 
 logger = get_logger("app")
 
@@ -677,13 +680,26 @@ class VoiceApp:
         self._spawn_worker(self._run_repolish, name="repolish-worker")
 
     def _build_repolish_processor(self) -> tuple:
-        """建立重新潤色用的 LLM 處理器和角色 ID。"""
+        """建立重新潤色用的 LLM 處理器和角色 ID。
+
+        重新潤色係用戶主動撳快捷鍵觸發，唔受「LLM 潤色」總開關（llm.enabled）影響：
+        LLMProcessor._is_ready() 會讀 config.enabled 並拒絕呼叫，所以凡係總開關
+        關咗嘅路徑都必須用 dataclasses.replace(..., enabled=True) 顯式覆蓋，否則
+        processor 建到都好，process() 一樣會即刻返「LLM 未就緒」、唔會真正打出去。
+        """
         repolish_provider = self._config.llm.repolish_provider if self._config else ""
         repolish_model = self._config.llm.repolish_model if self._config else ""
         repolish_role = self._config.llm.repolish_role if self._config else ""
 
         if not repolish_provider:
-            return self._llm, repolish_role
+            # 總開關開住且已有處理器 → 復用（保留連線池 / 對話歷史）。
+            # 總開關關咗時 self._llm 未必係 None（session 內由開切關，
+            # _apply_config 會把 enabled=False 灌入呢個共用物件）——但唔可以
+            # 復用佢嚟繞過總開關，因為佢同主語音管線共用，改親會令正常錄音
+            # 都跟住恢復潤色；呢種情況同 self._llm is None 一齊行 fallback。
+            if self._config and self._llm is not None and self._config.llm.enabled:
+                return self._llm, repolish_role
+            return self._make_fallback_repolish_processor(), repolish_role
 
         try:
             from llm.processor import LLMProcessor
@@ -697,15 +713,49 @@ class VoiceApp:
 
             temp_llm_config = replace(
                 self._config.llm,
+                enabled=True,
                 active_provider=repolish_provider,
                 providers=temp_providers,
             )
             processor = LLMProcessor(temp_llm_config)
+            if not processor._is_ready():
+                # 指定嘅 repolish_provider 唔存在/缺 API Key → 如實話畀用戶知，
+                # 唔好靜默起一個打唔通嘅 processor 令流程扮成功。
+                logger.warning("重新潤色指定服務商 '%s' 不可用（未配置或缺 API Key）", repolish_provider)
+                return None, repolish_role
             logger.info("重新潤色使用服務商: %s, 模型: %s", repolish_provider, repolish_model or "預設")
             return processor, repolish_role
         except Exception as err:
             logger.error("建立重新潤色 LLM 處理器失敗: %s", err)
-            return self._llm, repolish_role
+            return self._make_fallback_repolish_processor(), repolish_role
+
+    def _make_fallback_repolish_processor(self) -> LLMProcessor | None:
+        """self._llm 唔可用（總開關關咗，或未建立）時，即場建重新潤色專用處理器。
+
+        沿用原本 active_provider + providers，但顯式 enabled=True 繞過總開關
+        （唔改 self._config 本身，只係傳去 LLMProcessor 嘅臨時副本）。真係冇任何
+        可用服務商（例如未填 API Key）時返 None，等 _run_repolish() 如實顯示
+        「未配置 LLM」，唔好起一個唔會用嘅 processor 令流程靜默貼返原文扮成功。
+        """
+        if not self._config:
+            return None
+
+        from llm.provider import get_active_provider
+
+        if get_active_provider(self._config.llm) is None:
+            return None
+
+        try:
+            from llm.processor import LLMProcessor
+            processor = LLMProcessor(replace(self._config.llm, enabled=True))
+            logger.info(
+                "LLM 總開關已關，重新潤色即場建立處理器（服務商: %s）",
+                self._config.llm.active_provider or "無",
+            )
+            return processor
+        except Exception as err:
+            logger.error("即場建立重新潤色 LLM 處理器失敗: %s", err)
+            return None
 
     def _run_repolish(self) -> None:
         """背景線程：對 _last_result 重新執行 LLM 潤色並貼上。"""
