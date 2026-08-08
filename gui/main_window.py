@@ -16,6 +16,7 @@ CC語音 - 主視窗
 from __future__ import annotations
 
 from datetime import datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
 from PySide6.QtCore import Qt, QTimer, Signal, Slot
@@ -215,6 +216,22 @@ class MainWindow(QMainWindow):
             self._sync_indicator_state(status, prev)
 
         logger.debug("狀態更新: %s", status)
+
+    @Slot(object)
+    def set_hotword_manager(self, manager: object) -> None:
+        """熱詞管理器被重建／關閉後同步給熱詞分頁（R14）。
+
+        原本只有 _navigate_to_settings 會 set_manager，所以停用後再啟用時
+        分頁一直握著 None，六個 CRUD 全部靜默失效。
+        """
+        panel = self._settings_panel
+        if panel is None:
+            return
+        try:
+            panel._tab_hotword.set_manager(manager)
+            logger.info("熱詞分頁已同步 manager: %s", "已連接" if manager else "未連接")
+        except Exception as err:
+            logger.error("同步熱詞 manager 失敗: %s", err)
 
     @Slot(str)
     def notify_warning(self, message: str) -> None:

@@ -26,6 +26,7 @@ import urllib3
 from llm.client import _POOL_MANAGER
 from llm.provider import ProviderInfo
 from utils.logger import get_logger
+from utils.secrets import redact as _redact
 
 logger = get_logger("llm.model_fetcher")
 
@@ -51,8 +52,23 @@ def _is_chat_model(model_id: str) -> bool:
     return not any(marker in low for marker in _NON_CHAT_MARKERS)
 
 
-def _http_get_json(url: str, headers: dict[str, str], timeout: int) -> dict[str, Any]:
-    """GET 一個 JSON 端點，回傳解析後的 dict（沿用 client 的錯誤訊息風格）。"""
+# 共用實作見 utils/secrets（GUI 也會用，不應從 llm 層 import）
+redact = _redact
+
+
+def _http_get_json(
+    url: str,
+    headers: dict[str, str],
+    timeout: int,
+    secret: str | None = None,
+) -> dict[str, Any]:
+    """
+    GET 一個 JSON 端點，回傳解析後的 dict（沿用 client 的錯誤訊息風格）。
+
+    Args:
+        secret: 本次請求使用的 API Key；所有拋出的訊息會先把它 redact 掉，
+                避免 urllib3 例外把含金鑰的 request_uri 寫進 log 或顯示在 UI。
+    """
     parsed = urlparse(url)
     if parsed.scheme != "https":
         raise RuntimeError(f"不支援的 URL 協議：{parsed.scheme!r}（僅允許 https）")
@@ -63,12 +79,12 @@ def _http_get_json(url: str, headers: dict[str, str], timeout: int) -> dict[str,
             timeout=urllib3.Timeout(connect=10, read=timeout),
         )
     except urllib3.exceptions.HTTPError as err:
-        raise RuntimeError(f"網路連線失敗：{err}")
+        raise RuntimeError(redact(f"網路連線失敗：{err}", secret))
     except (socket.timeout, TimeoutError):
         raise RuntimeError(f"連線逾時（{timeout} 秒）")
 
     if resp.status != 200:
-        body = resp.data.decode("utf-8", errors="replace")[:200]
+        body = redact(resp.data.decode("utf-8", errors="replace")[:200], secret)
         if resp.status == 401:
             raise RuntimeError("API Key 無效（HTTP 401）")
         if resp.status == 403:
@@ -84,7 +100,7 @@ def _http_get_json(url: str, headers: dict[str, str], timeout: int) -> dict[str,
     try:
         return json.loads(resp.data.decode("utf-8", errors="replace"))
     except ValueError as err:
-        raise RuntimeError(f"模型清單解析失敗：{err}")
+        raise RuntimeError(redact(f"模型清單解析失敗：{err}", secret))
 
 
 def _models_endpoint(api_url: str) -> str:
@@ -117,13 +133,19 @@ def _fetch_openai_like(provider: ProviderInfo, timeout: int) -> list[str]:
         _models_endpoint(provider.api_url),
         {"Authorization": f"Bearer {provider.api_key}"},
         timeout,
+        secret=provider.api_key,
     )
     return _parse_openai(data)
 
 
 def _fetch_google(provider: ProviderInfo, timeout: int) -> list[str]:
-    url = f"{_models_endpoint(provider.api_url)}?key={provider.api_key}"
-    data = _http_get_json(url, {}, timeout)
+    # 走 header 認證而非 ?key=，金鑰不會出現在 URL（也就不會被例外訊息帶進 log）
+    data = _http_get_json(
+        _models_endpoint(provider.api_url),
+        {"x-goog-api-key": provider.api_key},
+        timeout,
+        secret=provider.api_key,
+    )
     return _parse_google(data)
 
 
@@ -135,6 +157,7 @@ def _fetch_anthropic(provider: ProviderInfo, timeout: int) -> list[str]:
             "anthropic-version": "2023-06-01",
         },
         timeout,
+        secret=provider.api_key,
     )
     return _parse_openai(data)
 

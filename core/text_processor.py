@@ -109,13 +109,54 @@ _IDIOM_BLACKLIST = frozenset(
         "一月", "一心", "一路", "一邊", "一边", "一半",
         "七上八下", "亂七八糟", "乱七八糟", "四面八方",
         "三心二意", "五花八門", "五花八门", "九牛一毛",
+        "一五一十", "十之八九", "三三兩兩", "三三两两",
+        "不三不四", "一乾二淨", "一干二净", "橫七豎八",
+        "橫七竖八", "横七竖八", "四通八達", "四通八达",
+        "五花大綁", "五湖四海", "七零八落", "六神無主",
+        "六神无主", "十全十美", "百發百中", "百发百中",
+        "千方百計", "千方百计", "萬無一失", "万无一失",
+        "一心一意", "一模一樣", "一模一样", "獨一無二",
+        "独一无二", "三言兩語", "三言两语", "接二連三",
+        "接二连三", "低三下四", "顛三倒四", "颠三倒四",
+        "朝三暮四", "丟三落四", "丢三落四", "說一不二",
+        "说一不二", "數一數二", "数一数二", "舉一反三",
+        "举一反三", "一而再再而三",
     }
 )
+
+# 慣用語比對用（最長優先，避免「一五一十」被「一五」之類的短項先切走）
+_RE_IDIOM = re.compile(
+    "|".join(re.escape(w) for w in sorted(_IDIOM_BLACKLIST, key=len, reverse=True))
+)
+
+# 保護哨兵：轉換期間暫存慣用語，用不可能出現在 ASR 輸出的控制字元包夾
+_SENTINEL = "\x00"
+
+
+def _has_approximate_pair(text: str) -> bool:
+    """
+    判斷是否為概數（相鄰兩個連號數字），如「二三十」「三四天」「十五六」。
+
+    「零」作為連接詞（一百零一）不算，否則會誤判。
+    """
+    prev: Optional[int] = None
+    for char in text:
+        value = _CN_DIGITS.get(char)
+        if value is not None and value != 0:
+            if prev is not None and abs(value - prev) == 1:
+                return True
+            prev = value
+        else:
+            prev = None
+    return False
 
 
 def _digits_to_arabic(match: re.Match) -> str:
     """純數字序列轉阿拉伯數字：幺九二 → 192"""
     text = match.group()
+    # 剛好兩字且為連號（三四、七八）是概數而非號碼，原樣保留
+    if len(text) == 2 and _has_approximate_pair(text):
+        return text
     return "".join(str(_CN_DIGITS.get(c, c)) for c in text)
 
 
@@ -161,6 +202,9 @@ def _value_replace(match: re.Match) -> str:
     # 跳過慣用語
     if text in _IDIOM_BLACKLIST:
         return text
+    # 概數不轉換：二三十、十五六
+    if _has_approximate_pair(text):
+        return text
     # 至少包含一個量詞才轉換
     if not any(c in _CN_UNITS for c in text):
         return text
@@ -180,15 +224,22 @@ def chinese_to_number(text: str) -> str:
     - 數值+量詞：三百五十個 → 350個
     - 跳過慣用語
     """
-    # 先跳過包含慣用語的片段
-    for idiom in _IDIOM_BLACKLIST:
-        if idiom in text:
-            # 暫時替換慣用語，處理完再還原
-            pass
+    # 慣用語先換成哨兵佔位，三條轉換規則跑完再還原，
+    # 避免「一五一十」被 _RE_DIGIT_SEQ 拆成「151十」。
+    shielded: list[str] = []
+
+    def _shield(match: re.Match) -> str:
+        shielded.append(match.group())
+        return f"{_SENTINEL}{len(shielded) - 1}{_SENTINEL}"
+
+    text = _RE_IDIOM.sub(_shield, text)
 
     text = _RE_PERCENT.sub(_percent_replace, text)
     text = _RE_VALUE.sub(_value_replace, text)
     text = _RE_DIGIT_SEQ.sub(_digits_to_arabic, text)
+
+    for index, idiom in enumerate(shielded):
+        text = text.replace(f"{_SENTINEL}{index}{_SENTINEL}", idiom)
 
     return text
 

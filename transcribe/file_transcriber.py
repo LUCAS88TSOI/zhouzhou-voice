@@ -50,6 +50,16 @@ DEFAULT_SEG_OVERLAP = 4        # 重疊 4 秒
 # (原始識別 / 潤色結果) 對照，讓術語、人名、語氣保持跨段一致。
 _LLM_CONTEXT_WINDOW = 2
 
+# ─── 重疊區模糊去重參數 ───────────────────────────────────
+# 精確前後綴比對失敗時的相似度門檻。前後兩段的重疊區本來就是同一段音訊，
+# 只是聲學上下文不同令 ASR 差一兩個同音字（「再」vs「在」），
+# 0.6 代表「較短一側有六成字對得上」即視為同一段話。
+_FUZZY_OVERLAP_RATIO = 0.6
+# 重疊區短於此字數時不做模糊判定（1-2 字太容易誤判成重疊而被誤刪）
+_FUZZY_MIN_CHARS = 4
+# 模糊比對的最大取樣視窗（字），避免時間戳異常時 SequenceMatcher 爆炸
+_FUZZY_MAX_WINDOW = 400
+
 # 支援的媒體格式
 AUDIO_EXTENSIONS = frozenset({
     ".mp3", ".wav", ".m4a", ".flac", ".ogg", ".aac",
@@ -370,6 +380,34 @@ def _unique_path(path: Path) -> Path:
 
 # ─── Token 合併 ────────────────────────────────────────────
 
+def _overlap_similarity(prev_text: str, curr_text: str) -> float:
+    """
+    以 SequenceMatcher 對齊兩段重疊區文字，回傳「較短一側被覆蓋的比例」。
+
+    用覆蓋率而非 ratio()，是因為兩側重疊區長度常不一致（ASR 對邊界的
+    切法不同）；ratio() 會被較長一側稀釋，覆蓋率則能穩定反映
+    「curr 的開頭是不是 prev 結尾講過的同一段話」。
+
+    Args:
+        prev_text: 前一段落在重疊區的文字
+        curr_text: 後一段落在重疊區的文字
+
+    Returns:
+        0.0 ~ 1.0 的相似度
+    """
+    a = prev_text[-_FUZZY_MAX_WINDOW:]
+    b = curr_text[:_FUZZY_MAX_WINDOW]
+    shorter = min(len(a), len(b))
+    if shorter <= 0:
+        return 0.0
+
+    # autojunk=False：預設會把長序列中的高頻字元當雜訊丟掉，中文重複字多，
+    # 開著會讓相似度嚴重偏低。
+    matcher = SequenceMatcher(None, a, b, autojunk=False)
+    matched = sum(block.size for block in matcher.get_matching_blocks())
+    return matched / shorter
+
+
 def merge_segment_tokens(
     segments: List[SegmentResult],
     overlap: float = DEFAULT_SEG_OVERLAP,
@@ -377,8 +415,12 @@ def merge_segment_tokens(
     """
     合併多段識別結果，去除重疊區域的重複 token。
 
-    使用 SequenceMatcher 進行重疊區 token 去重，
-    確保時間戳連續且不重複。
+    兩階段去重：
+    1. 最長精確前後綴比對 —— 命中時按字元數精準裁掉 curr 的重疊前綴，
+       落在 token 內部的部分會保留非重疊後綴。
+    2. 精確比對失敗（ASR 對重疊區差了一兩個同音字）時，改用
+       `_overlap_similarity()` 做 SequenceMatcher 模糊判定；相似度達標
+       即整段丟棄 curr 的重疊區 —— 該區本來就與 prev 尾部代表同一段音訊。
 
     Args:
         segments: 排序好的分段結果列表
@@ -438,23 +480,34 @@ def merge_segment_tokens(
             # 找出最長精確匹配
             max_overlap = 0
             max_check = min(len(prev_text), len(curr_text))  # 完整檢查，不限制長度
-            for i in range(max_check, 0, -1):
-                if prev_text[-i:] == curr_text[:i]:
-                    max_overlap = i
+            for n in range(max_check, 0, -1):
+                if prev_text[-n:] == curr_text[:n]:
+                    max_overlap = n
                     break
 
             # 根據重疊字符數估算要跳過的 token 數量
             if max_overlap > 0:
                 skipped_chars = 0
-                for i, token in enumerate(curr_seg.tokens[:curr_overlap_end_idx]):
+                for t_idx, token in enumerate(curr_seg.tokens[:curr_overlap_end_idx]):
                     skipped_chars += len(token)
                     if skipped_chars >= max_overlap:
                         # 如果 token 只有部分在重疊區，保留非重疊後綴
                         overlap_in_token = max_overlap - (skipped_chars - len(token))
                         if overlap_in_token < len(token):
                             partial_prefix = token[overlap_in_token:]
-                        curr_start = i + 1
+                        curr_start = t_idx + 1
                         break
+
+            # 精確比對失敗 → 模糊比對保底。前後段的重疊區代表同一段音訊，
+            # 只要相似度達標就整段丟棄 curr 的重疊區；否則寧可保留（不誤刪）。
+            elif max_check >= _FUZZY_MIN_CHARS:
+                similarity = _overlap_similarity(prev_text, curr_text)
+                if similarity >= _FUZZY_OVERLAP_RATIO:
+                    curr_start = curr_overlap_end_idx
+                    logger.debug(
+                        "段界模糊去重: 相似度 %.2f, 丟棄重疊區 %d token (%r)",
+                        similarity, curr_overlap_end_idx, curr_text[:20],
+                    )
 
         # 追加部分重疊 token 的非重疊後綴
         if partial_prefix:

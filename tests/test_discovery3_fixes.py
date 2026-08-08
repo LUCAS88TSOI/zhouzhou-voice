@@ -60,7 +60,7 @@ class TestF4ClearStaleResult:
     def test_empty_asr_clears_last_result(self):
         """ASR 回傳空字串時 _last_result 應被清空。"""
         from unittest.mock import MagicMock, patch
-        from app.app import VoiceApp
+        from app.app import AsrOutcome, VoiceApp
         from utils.config import AppConfig
         import numpy as np
 
@@ -80,7 +80,7 @@ class TestF4ClearStaleResult:
 
         # 模擬 ASR 返回空結果
         va._asr_process.is_running = True
-        with patch.object(va, "_try_recognize", return_value=""):
+        with patch.object(va, "_try_recognize", return_value=AsrOutcome(text="")):
             # 產生 0.5 秒 float32 音頻
             audio = np.zeros(8000, dtype=np.float32).tobytes()
             va._process_audio(audio)
@@ -91,7 +91,7 @@ class TestF4ClearStaleResult:
     def test_noise_only_clears_last_result(self):
         """ASR 回傳純標點時 _last_result 應被清空。"""
         from unittest.mock import MagicMock, patch
-        from app.app import VoiceApp
+        from app.app import AsrOutcome, VoiceApp
         from utils.config import AppConfig
         import numpy as np
 
@@ -110,7 +110,7 @@ class TestF4ClearStaleResult:
         va._recording_db = None
 
         va._asr_process.is_running = True
-        with patch.object(va, "_try_recognize", return_value="，。！？"):
+        with patch.object(va, "_try_recognize", return_value=AsrOutcome(text="，。！？")):
             audio = np.zeros(8000, dtype=np.float32).tobytes()
             va._process_audio(audio)
 
@@ -176,6 +176,7 @@ class TestF6RepolishHotkeyRebuild:
         va._config = old_cfg
         va._hotkey = MagicMock()
         va._repolish_hotkey = MagicMock()
+        va._polish_selection_hotkey = MagicMock()
         va._llm = None
         va._main_window = None
         va._recording_db = None
@@ -204,6 +205,7 @@ class TestF6RepolishHotkeyRebuild:
         va._config = old_cfg
         va._hotkey = MagicMock()
         va._repolish_hotkey = MagicMock()
+        va._polish_selection_hotkey = MagicMock()
         va._llm = None
         va._main_window = None
         va._recording_db = None

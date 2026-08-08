@@ -169,7 +169,7 @@ class _FakeClient:
     def __init__(self, text):
         self._text = text
 
-    def chat_with_warnings(self, messages, stream=True):
+    def chat_with_warnings(self, messages, stream=True, meta=None):
         if self._text is None:
             def _gen():
                 raise RuntimeError("API Key 無效（HTTP 401）")
@@ -183,7 +183,7 @@ def test_llm_failover_on_auth_error():
     from unittest.mock import patch
     from llm.processor import LLMProcessor, RoleConfig
 
-    def _fake_build(self, provider, timeout=None):
+    def _fake_build(self, provider, timeout=None, max_tokens=None):
         return _FakeClient("潤色後結果" if provider.key == "backup" else None)
 
     with patch.object(LLMProcessor, "_build_client", _fake_build):
@@ -199,7 +199,7 @@ def test_llm_failover_all_dead_returns_error():
     from unittest.mock import patch
     from llm.processor import LLMProcessor, RoleConfig
 
-    def _all_dead(self, provider, timeout=None):
+    def _all_dead(self, provider, timeout=None, max_tokens=None):
         return _FakeClient(None)
 
     with patch.object(LLMProcessor, "_build_client", _all_dead):

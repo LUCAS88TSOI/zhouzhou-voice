@@ -58,6 +58,12 @@ class ASRResponse:
     error: str = ""
 
 
+# 載入結果哨兵：子進程無論成敗都必須回一個，start() 據此判定
+# （不能用 is_alive()——失敗的子進程送出錯誤後還在收尾，看起來仍活著）
+LOAD_OK_TASK_ID = "__load_ok__"
+LOAD_ERROR_TASK_ID = "__load_error__"
+
+
 def new_task_id() -> str:
     """產生唯一任務 ID。"""
     return uuid.uuid4().hex[:12]
@@ -77,6 +83,7 @@ class ASRProcess:
     """
 
     MODEL_LOAD_TIMEOUT = 120  # 模型載入超時（秒）
+    LOAD_ACK_TIMEOUT = 10     # ready_event 後等載入結果哨兵的秒數
 
     def __init__(
         self,
@@ -111,6 +118,9 @@ class ASRProcess:
 
         logger.info("正在啟動 ASR 子進程，模型: %s", self._model_dir)
         self._ready_event.clear()
+        # restart() 情境下，崩潰前的識別回應可能還留在 queue 裡；不先清掉的話
+        # 下面讀載入哨兵時會先讀到它，重啟必定被誤判為失敗。
+        self._drain_stale()
 
         self._process = Process(
             target=_worker_main,
@@ -134,17 +144,49 @@ class ASRProcess:
                 f"ASR 模型載入超時（{self.MODEL_LOAD_TIMEOUT} 秒）"
             )
 
-        if not self._process.is_alive():
-            error_msg = "ASR 子進程在模型載入期間異常退出"
-            try:
-                resp = self._queue_out.get_nowait()
-                if resp and resp.error:
-                    error_msg = f"ASR 模型載入失敗: {resp.error}"
-            except Exception as exc:
-                logger.debug("無法從 queue 讀取載入錯誤: %s", exc)
+        # 用子進程明確回報的哨兵判定成敗，不用 is_alive()：
+        # 子進程送出 __load_error__ 後還在 bootstrap 收尾，is_alive() 幾乎
+        # 必然為 True，會把載入失敗誤判成「載入完成」（R5）。
+        resp = self._await_load_ack()
+
+        if resp is None or resp.task_id != LOAD_OK_TASK_ID:
+            error_msg = (
+                f"ASR 模型載入失敗: {resp.error}"
+                if resp is not None and resp.error
+                else "ASR 子進程在模型載入期間異常退出"
+            )
+            self.stop()
             raise RuntimeError(error_msg)
 
         logger.info("ASR 模型載入完成")
+
+    def _await_load_ack(self) -> Optional[ASRResponse]:
+        """
+        讀取載入結果哨兵，跳過任何殘留的舊識別回應。
+
+        Returns:
+            載入成功／失敗的 ASRResponse；逾時或無法確認時回 None
+        """
+        deadline = time.monotonic() + self.LOAD_ACK_TIMEOUT
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                logger.error("等待 ASR 載入結果逾時")
+                return None
+            try:
+                resp = self._queue_out.get(timeout=remaining)
+            except queue.Empty:
+                logger.error("等待 ASR 載入結果逾時")
+                return None
+            except Exception as exc:
+                logger.error("讀取 ASR 載入結果失敗: %s", exc)
+                return None
+
+            if resp is None:
+                continue
+            if resp.task_id in (LOAD_OK_TASK_ID, LOAD_ERROR_TASK_ID):
+                return resp
+            logger.warning("丟棄載入前的過期 ASR 回應: task_id=%s", resp.task_id)
 
     def send(self, request: ASRRequest) -> None:
         """
@@ -293,12 +335,14 @@ def _worker_main(
     except Exception as err:
         logger.error("ASR 模型載入失敗: %s", err)
         queue_out.put(ASRResponse(
-            task_id="__load_error__",
+            task_id=LOAD_ERROR_TASK_ID,
             error=str(err),
         ))
         ready_event.set()
         return
 
+    # 成功也要明確回報，讓主進程能區分「載入完成」與「載入失敗但還沒死透」
+    queue_out.put(ASRResponse(task_id=LOAD_OK_TASK_ID))
     ready_event.set()
 
     # 主處理循環

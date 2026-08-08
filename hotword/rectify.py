@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -114,6 +115,9 @@ class RectifyStore:
 
     def __init__(self) -> None:
         self._pairs: tuple[RectifyPair, ...] = ()
+        self._apply_pattern: re.Pattern[str] | None = None
+        self._apply_map: dict[str, str] = {}
+        self._apply_key: tuple[RectifyPair, ...] | None = None
 
     @property
     def pair_count(self) -> int:
@@ -209,11 +213,27 @@ class RectifyStore:
 
         return suggestions
 
+    def _build_apply_index(self) -> None:
+        """建立單趟替換用的 pattern：所有 wrong 按長度降序排成 alternation。"""
+        mapping: dict[str, str] = {}
+        for pair in self._pairs:
+            mapping.setdefault(pair.wrong, pair.right)
+
+        self._apply_map = mapping
+        self._apply_key = self._pairs
+        self._apply_pattern = (
+            re.compile("|".join(re.escape(w) for w in sorted(mapping, key=len, reverse=True)))
+            if mapping else None
+        )
+
     def apply(self, text: str) -> str:
         """
         直接套用糾錯規則到文字（精確字串替換）。
 
         與 get_context() 不同，此方法直接將文字中的錯誤替換為正確寫法。
+
+        單趟掃描：所有規則同時比對原文、最長者優先，因此前一條規則的
+        產物不會被後一條規則再次替換（避免 A→B、B→C 連鎖成 A→C）。
 
         Args:
             text: 要校正的文字
@@ -221,8 +241,15 @@ class RectifyStore:
         Returns:
             校正後的文字
         """
-        result = text
-        for pair in self._pairs:
-            if pair.wrong in result:
-                result = result.replace(pair.wrong, pair.right)
-        return result
+        if not text or not self._pairs:
+            return text
+
+        if self._apply_key is not self._pairs:
+            self._build_apply_index()
+
+        if self._apply_pattern is None:
+            return text
+
+        return self._apply_pattern.sub(
+            lambda m: self._apply_map.get(m.group(), m.group()), text,
+        )

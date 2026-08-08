@@ -16,7 +16,9 @@ import json
 import os
 import shutil
 import tempfile
+import time
 from dataclasses import asdict, dataclass, field, replace
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -24,6 +26,27 @@ from utils.logger import get_logger
 from utils.paths import APP_VERSION
 
 logger = get_logger("config")
+
+
+# ─── 數值防禦工具（frozen dataclass __post_init__ 共用）───────
+#
+# 供各 config dataclass 嘅 __post_init__ 呼叫，防止 config.json 傳入壞值
+# （None / 非數字字串 / inf）導致啟動崩潰。int(float('inf')) 拋嘅係
+# OverflowError（ArithmeticError 子類），唔喺 TypeError/ValueError 之列，
+# 必須一齊 catch。
+
+def _safe_int(val: object, default: int, minimum: int = 1) -> int:
+    try:
+        return max(minimum, int(val))  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+def _safe_float(val: object, default: float, minimum: float = 0.0) -> float:
+    try:
+        return max(minimum, float(val))  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):
+        return default
 
 
 # ─── 預設 LLM 服務商 ──────────────────────────────────────
@@ -128,12 +151,16 @@ class ShortcutConfig:
     suppress: bool = False
     repolish_key: str = "f2"          # 重新潤色快捷鍵，空字串 = 停用
     repolish_instant: bool = True       # True = 速發（鬆開觸發），False = 長按觸發
+    polish_selection_key: str = ""      # 潤色選取文字快捷鍵，空字串 = 停用（預設不綁定）
+    polish_selection_instant: bool = True  # True = 速發（鬆開觸發），False = 長按觸發
 
     def __post_init__(self) -> None:
         if not isinstance(self.key, str) or not self.key:
             object.__setattr__(self, "key", "caps_lock")
         if not isinstance(self.repolish_key, str):
             object.__setattr__(self, "repolish_key", "")
+        if not isinstance(self.polish_selection_key, str):
+            object.__setattr__(self, "polish_selection_key", "")
 
 
 @dataclass(frozen=True)
@@ -165,6 +192,13 @@ class LLMConfig:
     repolish_model: str = ""            # 重新潤色專用模型，空字串 = 使用服務商預設模型
     repolish_role: str = ""             # 重新潤色專用角色，空字串 = 使用 active_role
     polish_timeout: float = 10.0        # 語音潤色逾時上限（秒），超時直接貼原文；0 = 不限制
+    min_polish_chars: int = 4           # 識別文字達此字數才送 LLM 潤飾（沿用舊硬編碼 _MIN_LLM_LENGTH 預設值）
+
+    def __post_init__(self) -> None:
+        # frozen=True 下必須用 object.__setattr__ 繞過 setattr 限制
+        # 只做下限防禦（壞值/非數字/inf fallback 到 4，clamp 到 1），不做上限 clamp（用戶要求「無上限」）
+        chars = _safe_int(self.min_polish_chars, 4, 1)
+        object.__setattr__(self, "min_polish_chars", chars)
 
 
 @dataclass(frozen=True)
@@ -241,18 +275,6 @@ class AudioConfig:
     def __post_init__(self) -> None:
         # frozen=True 下必須用 object.__setattr__ 繞過 setattr 限制
         # 對所有數值做邊界 clamp，避免 JSON 傳入壞值導致極端切段 / 無限迴圈
-        def _safe_int(val: object, default: int, minimum: int = 1) -> int:
-            try:
-                return max(minimum, int(val))  # type: ignore[arg-type]
-            except (TypeError, ValueError):
-                return default
-
-        def _safe_float(val: object, default: float, minimum: float = 0.0) -> float:
-            try:
-                return max(minimum, float(val))  # type: ignore[arg-type]
-            except (TypeError, ValueError):
-                return default
-
         max_rec = _safe_int(self.max_recording_seconds, 1800, 1)
         threshold = _safe_float(self.long_audio_threshold, 60.0, 1.0)
         seg = _safe_float(self.segment_seconds, 60.0, 1.0)
@@ -416,29 +438,151 @@ class ConfigManager:
     CONFIG_DIR = Path.home() / "AppData" / "Roaming" / "zhouzhou-voice"
     CONFIG_FILE = CONFIG_DIR / "config.json"
 
+    # 讀取層失敗的重試策略（防毒／同步軟體短暫鎖檔屬暫時性）
+    READ_RETRIES = 3
+    READ_RETRY_DELAY = 0.2
+
+    # 只保留最近幾份損壞備份：每份都含明文 API Key，不能無限累積
+    MAX_QUARANTINE_FILES = 3
+
+    # load() 是否因損壞而回退到預設值（供 UI 提示用戶）
+    _load_failed: bool = False
+    _quarantine_path: str = ""
+    # 檔案完全讀不到（非內容損壞）：禁止任何寫入，避免覆蓋掉完好的原檔
+    _read_failed: bool = False
+    # 磁碟上的 config.json 是否可信。載入時發現損壞就轉 False，
+    # save() 據此跳過 .bak 滾動——否則會用壞檔蓋掉唯一還留著 API Key 的備份。
+    _disk_trusted: bool = True
+
+    @classmethod
+    def load_failed(cls) -> bool:
+        """上次 load() 是否因檔案損壞而回退到預設值（供啟動時提示用戶）。"""
+        return cls._load_failed
+
+    @classmethod
+    def quarantine_path(cls) -> str:
+        """上次隔離起來的損壞檔路徑（沒有則空字串）。"""
+        return cls._quarantine_path
+
+    @classmethod
+    def _quarantine(cls, raw: str) -> None:
+        """把損壞的 config 另存成帶時間戳的副本，之後的 save 不會蓋掉它。"""
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        target = cls.CONFIG_DIR / f"config.corrupt.{stamp}.json"
+        try:
+            target.write_text(raw, encoding="utf-8")
+            cls._quarantine_path = str(target)
+            logger.error("配置檔損壞，原檔已備份至: %s", target)
+        except OSError as err:
+            logger.error("備份損壞的配置檔失敗: %s", err)
+            return
+
+        cls._prune_quarantine()
+
+    @classmethod
+    def _prune_quarantine(cls) -> None:
+        """只保留最近 MAX_QUARANTINE_FILES 份隔離檔（每份都含明文 API Key）。"""
+        try:
+            files = sorted(
+                cls.CONFIG_DIR.glob("config.corrupt.*.json"),
+                key=lambda p: p.name,
+                reverse=True,
+            )
+            for stale in files[cls.MAX_QUARANTINE_FILES:]:
+                stale.unlink(missing_ok=True)
+                logger.info("已清理舊的損壞備份: %s", stale.name)
+        except OSError as err:
+            logger.warning("清理舊的損壞備份失敗: %s", err)
+
+    @classmethod
+    def cleanup_temp_files(cls) -> None:
+        """清掉上次被硬殺時殘留的 .config_*.tmp（內含明文 API Key）。"""
+        try:
+            for tmp in cls.CONFIG_DIR.glob(".config_*.tmp"):
+                tmp.unlink(missing_ok=True)
+                logger.info("已清理殘留的設定暫存檔: %s", tmp.name)
+        except OSError as err:
+            logger.warning("清理設定暫存檔失敗: %s", err)
+
     @classmethod
     def load(cls) -> AppConfig:
         """
         載入配置。文件不存在時返回預設配置並創建文件。
 
+        檔案損壞時不再靜默重置：先把原檔隔離成 config.corrupt.<時間戳>.json，
+        再嘗試從 .bak 還原；兩者都失敗才回預設值，並設定 load_failed 旗標
+        讓 App 啟動後能提示用戶（否則 API Key 會無聲無息消失）。
+
         Returns:
             AppConfig 實例（不可變）
         """
+        cls._load_failed = False
+        cls._quarantine_path = ""
+        cls._disk_trusted = True
+        cls._read_failed = False
+
         if not cls.CONFIG_FILE.exists():
             logger.info("配置文件不存在，建立預設配置: %s", cls.CONFIG_FILE)
             config = AppConfig()
             cls.save(config)
             return config
 
+        # 讀取層失敗（防毒即時掃描 / OneDrive / 備份軟體短暫鎖檔）多數係暫時性，
+        # 重試幾次先當真。讀唔到 ≠ 內容壞咗，兩者必須分開處理（否則會用預設值
+        # 覆蓋掉其實完好無損的 config.json，API Key 真係冇咗）。
+        raw: str | None = None
+        for attempt in range(cls.READ_RETRIES):
+            try:
+                raw = cls.CONFIG_FILE.read_text(encoding="utf-8")
+                break
+            except OSError as err:
+                logger.warning(
+                    "配置文件讀取失敗（第 %d/%d 次）: %s",
+                    attempt + 1, cls.READ_RETRIES, err,
+                )
+                time.sleep(cls.READ_RETRY_DELAY)
+
+        if raw is None:
+            # 完全讀唔到 → 唔隔離（冇嘢可隔離）、唔重置、更加唔准寫回去，
+            # 只以預設值撐住本次執行，等下次啟動再試。
+            logger.error("配置文件無法讀取，本次執行以預設值運行且不會寫入設定檔")
+            cls._load_failed = True
+            cls._read_failed = True
+            cls._disk_trusted = False
+            return AppConfig()
+
         try:
-            raw = cls.CONFIG_FILE.read_text(encoding="utf-8")
             data = json.loads(raw)
             config = _dict_to_config(data)
             logger.info("配置載入成功: %s", cls.CONFIG_FILE)
             return config
         except (json.JSONDecodeError, TypeError, ValueError, AttributeError) as err:
-            logger.error("配置文件解析失敗，使用預設配置: %s", err)
-            return AppConfig()
+            logger.error("配置文件解析失敗: %s", err)
+
+        cls._quarantine(raw)
+        cls._disk_trusted = False
+
+        recovered = cls._load_backup()
+        if recovered is not None:
+            logger.warning("已從 .bak 還原配置（原檔損壞）")
+            return recovered
+
+        # .bak 也救不回 → 回預設值，但標記失敗讓 UI 能提示
+        cls._load_failed = True
+        logger.error("備份檔亦無法還原，暫時使用預設配置")
+        return AppConfig()
+
+    @classmethod
+    def _load_backup(cls) -> AppConfig | None:
+        """嘗試從 config.json.bak 還原，失敗回 None。"""
+        backup = Path(str(cls.CONFIG_FILE) + ".bak")
+        if not backup.exists():
+            return None
+        try:
+            return _dict_to_config(json.loads(backup.read_text(encoding="utf-8")))
+        except (json.JSONDecodeError, TypeError, ValueError, AttributeError, OSError) as err:
+            logger.error("備份配置解析失敗: %s", err)
+            return None
 
     @classmethod
     def save(cls, config: AppConfig) -> None:
@@ -453,6 +597,12 @@ class ConfigManager:
         Args:
             config: 要保存的 AppConfig 實例
         """
+        if cls._read_failed:
+            # 讀不到原檔（暫時性鎖檔）→ 本次執行拿的是預設值，寫回去就會
+            # 把完好的 config.json（含 API Key）永久覆蓋掉。
+            logger.error("設定檔本次無法讀取，已跳過保存以免覆蓋原檔")
+            return
+
         cls.CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         data = _config_to_dict(config)
         payload = json.dumps(data, ensure_ascii=False, indent=2)
@@ -466,7 +616,9 @@ class ConfigManager:
                 f.flush()
                 os.fsync(f.fileno())
             # 置換前保留上次良好副本（容錯：備份失敗不影響主流程，但記 log 以便排查）
-            if cls.CONFIG_FILE.exists():
+            # 本次載入失敗時「不」滾動 .bak——那份可能是唯一還留著 API Key 的副本，
+            # 一旦被預設值蓋掉就永久遺失。
+            if cls.CONFIG_FILE.exists() and cls._disk_trusted:
                 try:
                     shutil.copy2(str(cls.CONFIG_FILE), str(cls.CONFIG_FILE) + ".bak")
                 except Exception as bak_err:
@@ -480,6 +632,8 @@ class ConfigManager:
             except Exception as cleanup_err:
                 logger.warning("清理臨時 config 檔失敗: %s", cleanup_err)
             raise
+        # 寫入成功 → 磁碟上已是完整可信的內容，之後的 save 可正常滾動 .bak
+        cls._disk_trusted = True
         logger.info("配置已保存: %s", cls.CONFIG_FILE)
 
     @classmethod

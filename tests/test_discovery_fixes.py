@@ -153,6 +153,15 @@ def test_p3_audio_config_non_numeric_string():
     assert cfg.segment_seconds >= 1.0
 
 
+def test_p3_audio_config_infinity_max_recording():
+    """code review MEDIUM-3：int(float('inf')) 拋 OverflowError（非
+    TypeError/ValueError），舊 clamp 冇接住；壞 config.json 寫入 Infinity
+    （json.loads 合法字面值）會令啟動崩潰。"""
+    from utils.config import AudioConfig
+    cfg = AudioConfig(max_recording_seconds=float("inf"))
+    assert cfg.max_recording_seconds == 1800
+
+
 # ─── P4: probe_duration ffmpeg -i fallback ────────────────
 
 def test_p4_parse_ffmpeg_duration():

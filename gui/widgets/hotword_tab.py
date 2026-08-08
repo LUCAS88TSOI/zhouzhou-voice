@@ -6,6 +6,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QCheckBox,
     QDoubleSpinBox,
@@ -15,12 +16,15 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QListWidget,
+    QListWidgetItem,
+    QMessageBox,
     QPushButton,
     QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
+from hotword.rules import REGEX_PREFIX, validate_pattern
 from utils.config import HotwordConfig
 from utils.logger import get_logger
 
@@ -28,6 +32,10 @@ if TYPE_CHECKING:
     from hotword.manager import HotwordManager
 
 logger = get_logger("hotword_tab")
+
+# 無效規則的列表標記
+_INVALID_MARK = "  ⚠ 規則無效，未生效"
+_INVALID_COLOR = QColor("#d32f2f")
 
 
 class HotwordTab(QWidget):
@@ -134,12 +142,22 @@ class HotwordTab(QWidget):
         layout = QVBoxLayout(page)
         layout.setContentsMargins(4, 4, 4, 4)
 
+        self._rule_hint_label = QLabel(
+            f"預設為純文字比對（(笑)、C++、Node.js 都當字面處理）；"
+            f"需要正則請在匹配詞前加 {REGEX_PREFIX} 前綴，例如 {REGEX_PREFIX}\\d+"
+        )
+        self._rule_hint_label.setWordWrap(True)
+        self._rule_hint_label.setStyleSheet("color: #888; padding: 2px;")
+        layout.addWidget(self._rule_hint_label)
+
         self._rule_list = QListWidget()
         layout.addWidget(self._rule_list, stretch=1)
 
         row = QHBoxLayout()
         self._rule_pattern_input = QLineEdit()
-        self._rule_pattern_input.setPlaceholderText("匹配詞，例如：愛皮愛")
+        self._rule_pattern_input.setPlaceholderText(
+            f"匹配詞，例如：愛皮愛（正則加 {REGEX_PREFIX} 前綴）"
+        )
         row.addWidget(self._rule_pattern_input, stretch=1)
 
         eq_label = QLabel("=")
@@ -224,6 +242,17 @@ class HotwordTab(QWidget):
         replacement = self._rule_replace_input.text().strip()
         if not pattern or not replacement or self._manager is None:
             return
+
+        # 只有 re: 前綴的規則才會被當正則，編譯不過就拒絕新增
+        error = validate_pattern(pattern)
+        if error is not None:
+            logger.warning("拒絕新增無效規則: %s — %s", pattern, error)
+            QMessageBox.warning(
+                self, "規則無效",
+                f"無法新增這條規則：\n\n{pattern}\n\n{error}",
+            )
+            return
+
         self._manager.add_rule(pattern, replacement)
         self._rule_pattern_input.clear()
         self._rule_replace_input.clear()
@@ -233,7 +262,9 @@ class HotwordTab(QWidget):
         item = self._rule_list.currentItem()
         if item is None or self._manager is None:
             return
-        self._manager.remove_rule(item.text())
+        # 無效規則的顯示文字帶警告後綴，刪除必須用 UserRole 存的原始行
+        line = item.data(Qt.ItemDataRole.UserRole) or item.text()
+        self._manager.remove_rule(str(line))
         self._refresh_lists()
 
     def _on_add_rectify(self) -> None:
@@ -255,22 +286,48 @@ class HotwordTab(QWidget):
 
     # ─── 列表刷新 ─────────────────────────────────────────
 
+    def _set_crud_enabled(self, enabled: bool) -> None:
+        """啟用／停用三個子分頁的輸入框與按鈕。
+
+        manager 為 None 時六個 CRUD 全部靜默 return，按「新增」連輸入框的字
+        都不會被清掉，零回饋。直接 disable 讓死狀態一眼可見（R14）。
+        勾選框與閾值不在此列——使用者正是要靠它們把熱詞開回來。
+        """
+        for widget in self.findChildren(QLineEdit):
+            widget.setEnabled(enabled)
+        for widget in self.findChildren(QPushButton):
+            widget.setEnabled(enabled)
+
     def _refresh_lists(self) -> None:
         """從 HotwordManager 讀取文件內容刷新所有列表。"""
+        self._set_crud_enabled(self._manager is not None)
+
         if self._manager is None:
             self._hotword_list.clear()
             self._rule_list.clear()
             self._rectify_list.clear()
-            self._stats_label.setText("統計：未連接熱詞管理器")
+            self._stats_label.setText(
+                "熱詞系統未啟用 — 請勾選上方「啟用熱詞校正」並按儲存"
+            )
+            self._stats_label.setStyleSheet("color: #d32f2f; padding: 2px;")
             return
+
+        self._stats_label.setStyleSheet("")
 
         self._hotword_list.clear()
         for word in self._manager.get_hotwords():
             self._hotword_list.addItem(word)
 
         self._rule_list.clear()
+        invalid = self._invalid_rule_map()
         for rule in self._manager.get_rules():
-            self._rule_list.addItem(rule)
+            reason = invalid.get(rule.strip())
+            item = QListWidgetItem(rule if reason is None else rule + _INVALID_MARK)
+            item.setData(Qt.ItemDataRole.UserRole, rule)
+            if reason is not None:
+                item.setForeground(_INVALID_COLOR)
+                item.setToolTip(reason)
+            self._rule_list.addItem(item)
 
         self._rectify_list.clear()
         for pair in self._manager.get_rectify_pairs():
@@ -278,13 +335,24 @@ class HotwordTab(QWidget):
 
         self._update_stats()
 
+    def _invalid_rule_map(self) -> dict[str, str]:
+        """向 RuleEngine 取無效規則：{原始規則行: 錯誤訊息}。取不到時視為無。"""
+        engine = getattr(self._manager, "_rule_engine", None)
+        try:
+            return {line.strip(): msg for line, msg in getattr(engine, "invalid_rules", ())}
+        except (TypeError, ValueError) as err:
+            logger.warning("讀取無效規則清單失敗: %s", err)
+            return {}
+
     def _update_stats(self) -> None:
         """更新統計標籤。"""
         if self._manager is None:
             return
+        invalid_count = len(self._invalid_rule_map())
+        invalid_note = f"（{invalid_count} 條無效）" if invalid_count else ""
         self._stats_label.setText(
             f"統計：{self._manager.hotword_count} 個熱詞, "
-            f"{self._manager.rule_count} 條規則, "
+            f"{self._manager.rule_count} 條規則{invalid_note}, "
             f"{self._manager.rectify_count} 條糾錯"
         )
 

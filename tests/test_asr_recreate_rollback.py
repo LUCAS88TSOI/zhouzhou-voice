@@ -79,6 +79,25 @@ class TestT1StopBeforeStage:
         assert va._asr_process is not old_asr_process
         assert result is True
 
+    def test_old_process_not_stopped_when_not_running(self):
+        """code review MEDIUM-5：舊進程 is_running=False 時唔應該 call .stop()
+        （避免對一個已經停咗嘅進程做多餘/可能出錯嘅操作）。"""
+        va, new_config = _make_va_for_recreate()
+        old_asr_process = va._asr_process
+        old_asr_process.is_running = False
+
+        def fake_init_asr():
+            va._asr_process = MagicMock(name="new_asr_process")
+            va._asr_process.is_running = True
+
+        va._init_asr = fake_init_asr
+
+        result = va._apply_config_recreate_asr(new_config)
+
+        old_asr_process.stop.assert_not_called()
+        va._lifecycle.unregister_shutdown.assert_not_called()
+        assert result is True
+
     def test_config_rolled_back_on_failure(self):
         """Bug 6 修復：失敗時恢復 config（與 _apply_config 流程兼容）"""
         va, new_config = _make_va_for_recreate()

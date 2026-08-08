@@ -43,6 +43,24 @@ class MatchResult:
     similarity: float
 
 
+@dataclass(frozen=True)
+class MatchSpan:
+    """
+    一處匹配及其在**原文**中的絕對字元區間 [start, end)。
+
+    帶位置資訊才能做切片替換，避免 str.replace 的全文語意誤改別處。
+    """
+    start: int
+    end: int
+    original: str
+    matched: str
+    similarity: float
+
+    def overlaps(self, other: "MatchSpan") -> bool:
+        """判斷兩個區間是否有交集（半開區間，相鄰不算重疊）。"""
+        return self.start < other.end and other.start < self.end
+
+
 # ─── 拼音工具函數 ──────────────────────────────────────────
 
 _CHINESE_CHAR_PATTERN = re.compile(r"[\u4e00-\u9fff]")
@@ -147,12 +165,25 @@ _SEGMENT_PATTERN = re.compile(
 )
 
 
+def _segment_spans(text: str) -> list[tuple[int, str]]:
+    """
+    將文字按中文/英文區塊分段，並保留每段在原文的起始位置。
+
+    連續的中文字為一段，連續的英文/數字為一段，
+    標點和空白被忽略（因此各段在原文中互不重疊）。
+
+    Args:
+        text: 輸入文字
+
+    Returns:
+        (原文起始索引, 段落文字) 列表
+    """
+    return [(m.start(), m.group()) for m in _SEGMENT_PATTERN.finditer(text)]
+
+
 def _segment_text(text: str) -> list[str]:
     """
     將文字按中文/英文區塊分段。
-
-    連續的中文字為一段，連續的英文/數字為一段，
-    標點和空白被忽略。
 
     Args:
         text: 輸入文字
@@ -160,7 +191,28 @@ def _segment_text(text: str) -> list[str]:
     Returns:
         分段列表
     """
-    return _SEGMENT_PATTERN.findall(text)
+    return [segment for _, segment in _segment_spans(text)]
+
+
+def _extract_ngram_spans(
+    segment: str, min_len: int, max_len: int,
+) -> list[tuple[int, int]]:
+    """
+    列出段落中所有 n-gram 的字元區間 [start, end)。
+
+    Args:
+        segment: 中文文字段落
+        min_len: 最短 n-gram 字數
+        max_len: 最長 n-gram 字數
+
+    Returns:
+        區間列表（按長度遞增、起點遞增排列）
+    """
+    return [
+        (start, start + n)
+        for n in range(min_len, min(max_len, len(segment)) + 1)
+        for start in range(len(segment) - n + 1)
+    ]
 
 
 def _extract_ngrams(
@@ -177,11 +229,10 @@ def _extract_ngrams(
     Returns:
         所有可能的 n-gram 子串
     """
-    ngrams: list[str] = []
-    for n in range(min_len, min(max_len, len(segment)) + 1):
-        for start in range(len(segment) - n + 1):
-            ngrams.append(segment[start : start + n])
-    return ngrams
+    return [
+        segment[start:end]
+        for start, end in _extract_ngram_spans(segment, min_len, max_len)
+    ]
 
 
 # ─── 音素索引 ──────────────────────────────────────────────
@@ -247,7 +298,7 @@ class PhonemeIndex:
 
         將文字分段後，對每個中文段落提取 n-gram，
         與索引中的熱詞比較拼音相似度，超過閾值則替換。
-        英文段落原樣保留。
+        每段可命中多個互不重疊的熱詞，英文段落原樣保留。
 
         Args:
             text: ASR 輸出文字
@@ -259,20 +310,24 @@ class PhonemeIndex:
         if not self._entries or not text:
             return text
 
-        result = text
-
-        # 對每個中文段落嘗試匹配
-        segments = _segment_text(text)
-
-        for segment in segments:
+        # 收集所有段落的匹配（位置為原文絕對索引，彼此互不重疊）
+        spans: list[MatchSpan] = []
+        for offset, segment in _segment_spans(text):
             if not _is_chinese(segment[0]):
                 continue
 
-            best = _find_best_match(
-                segment, self._entries, self._min_len, self._max_len, threshold,
-            )
-            if best is not None:
-                result = result.replace(best.original, best.matched, 1)
+            spans.extend(_find_matches(
+                segment, offset, self._entries,
+                self._min_len, self._max_len, threshold,
+            ))
+
+        if not spans:
+            return text
+
+        # 從後往前做切片替換：前面的區間索引不受影響
+        result = text
+        for span in sorted(spans, key=lambda s: s.start, reverse=True):
+            result = result[:span.start] + span.matched + result[span.end:]
 
         return result
 
@@ -329,56 +384,79 @@ class PhonemeIndex:
 
 # ─── 內部匹配函數 ──────────────────────────────────────────
 
-def _find_best_match(
+def _find_matches(
     segment: str,
+    offset: int,
     entries: tuple[PhonemeEntry, ...],
     min_len: int,
     max_len: int,
     threshold: float,
-) -> MatchResult | None:
+) -> list[MatchSpan]:
     """
-    在一個中文段落中找到最佳熱詞匹配。
+    在一個中文段落中找出一組**互不重疊**的熱詞匹配。
 
-    優先選擇：相似度最高 → 長度最長（更精確的匹配）。
+    流程：
+    1. 對每個 n-gram 區間取相似度最高的熱詞（同分取索引中較前者），
+       達到閾值才成為候選。
+    2. 候選按「相似度降序 → 長度降序 → 起點升序」排序後貪心挑選，
+       與已選區間重疊者跳過。
+
+    段落中已與熱詞完全相同的 n-gram 不需替換，但仍會佔位，
+    避免被相似度較低的模糊匹配覆蓋。
 
     Args:
         segment: 中文文字段落
+        offset: 該段落在原文中的起始索引
         entries: 熱詞條目
         min_len: 最短 n-gram
         max_len: 最長 n-gram
         threshold: 匹配閾值
 
     Returns:
-        最佳匹配結果，無匹配則返回 None
+        需要替換的匹配列表（位置為原文絕對索引，互不重疊）
     """
-    best: MatchResult | None = None
+    pinyin_cache: dict[str, tuple[str, ...]] = {}
+    candidates: list[MatchSpan] = []
 
-    ngrams = _extract_ngrams(segment, min_len, max_len)
+    for start, end in _extract_ngram_spans(segment, min_len, max_len):
+        ngram = segment[start:end]
 
-    for ngram in ngrams:
-        ngram_pinyin = _text_to_pinyin(ngram)
+        if ngram not in pinyin_cache:
+            pinyin_cache[ngram] = _text_to_pinyin(ngram)
+        ngram_pinyin = pinyin_cache[ngram]
+
+        best_word: str | None = None
+        best_sim = 0.0
 
         for entry in entries:
-            # 跳過完全相同的（不需要替換）
+            # 完全相同：無需替換，但佔位保護（相似度視為滿分）
             if entry.word == ngram:
-                continue
+                best_word, best_sim = ngram, 1.0
+                break
 
             sim = _compute_similarity(ngram_pinyin, entry.pinyin)
+            if sim >= threshold and sim > best_sim:
+                best_word, best_sim = entry.word, sim
 
-            if sim < threshold:
-                continue
-
-            candidate = MatchResult(
+        if best_word is not None:
+            candidates.append(MatchSpan(
+                start=offset + start,
+                end=offset + end,
                 original=ngram,
-                matched=entry.word,
-                similarity=sim,
-            )
+                matched=best_word,
+                similarity=best_sim,
+            ))
 
-            if best is None:
-                best = candidate
-            elif sim > best.similarity:
-                best = candidate
-            elif sim == best.similarity and len(ngram) > len(best.original):
-                best = candidate
+    # 相似度高、覆蓋長的優先；同分時取靠前者，確保結果穩定
+    candidates.sort(
+        key=lambda c: (-c.similarity, -(c.end - c.start), c.start),
+    )
 
-    return best
+    selected: list[MatchSpan] = []
+    for candidate in candidates:
+        if any(candidate.overlaps(chosen) for chosen in selected):
+            continue
+        selected.append(candidate)
+
+    # 過濾佔位用的同字匹配
+    return [span for span in selected if span.matched != span.original]

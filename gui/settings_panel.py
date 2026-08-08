@@ -120,11 +120,7 @@ class SettingsPanel(QWidget):
 
         # 建立六個頁籤
         self._tab_shortcut = self._build_shortcut_tab()
-        self._tab_asr = ASRModelTab(
-            models_dir=self._models_dir,
-            current_key=config.asr.model,
-            parent=self,
-        )
+        self._tab_asr = self._build_asr_tab(config)
         self._tab_llm = self._build_llm_tab()
         self._tab_role = RoleTab(
             active_role_id=config.llm.active_role,
@@ -196,6 +192,8 @@ class SettingsPanel(QWidget):
             suppress=self._suppress_check.isChecked(),
             repolish_key=self._repolish_key_input.get_key(),
             repolish_instant=self._repolish_instant_combo.currentIndex() == 0,
+            polish_selection_key=self._polish_selection_key_input.get_key(),
+            polish_selection_instant=self._polish_selection_instant_combo.currentIndex() == 0,
         )
 
         new_llm = LLMConfig(
@@ -216,6 +214,7 @@ class SettingsPanel(QWidget):
             repolish_model=self._repolish_model_input.currentText().strip() if self._repolish_provider_combo.currentData() else "",
             repolish_role=self._tab_role.get_repolish_role(),
             polish_timeout=float(self._polish_timeout_spin.value()),
+            min_polish_chars=self._min_polish_chars_spin.value(),
         )
 
         new_output = OutputConfig(
@@ -234,8 +233,13 @@ class SettingsPanel(QWidget):
         )
 
         new_asr = ASRConfig(
-            model=self._tab_asr.get_selected_model_key(),
+            model=self._tab_asr_inner.get_selected_model_key(),
             language=self._config.asr.language,
+        )
+
+        new_audio = replace(
+            self._config.audio,
+            max_recording_seconds=self._max_recording_spin.value(),
         )
 
         history_values = self._tab_history.get_config_values()
@@ -266,6 +270,7 @@ class SettingsPanel(QWidget):
             hotword=new_hotword,
             file=self._config.file,
             ui=new_ui,
+            audio=new_audio,
         )
 
     # ─────────────────────────────────────────────
@@ -298,13 +303,55 @@ class SettingsPanel(QWidget):
         self._repolish_instant_combo.addItems(["速發（鬆開觸發）", "長按（按住 0.3 秒）"])
         form.addRow("重新潤色模式：", self._repolish_instant_combo)
 
+        self._polish_selection_key_input = ShortcutInput()
+        form.addRow("潤色選取文字鍵：", self._polish_selection_key_input)
+
+        self._polish_selection_instant_combo = QComboBox()
+        self._polish_selection_instant_combo.addItems(["速發（鬆開觸發）", "長按（按住 0.3 秒）"])
+        form.addRow("潤色選取文字模式：", self._polish_selection_instant_combo)
+
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setWidget(inner)
         return scroll
 
     # ─────────────────────────────────────────────
-    #  頁籤 2：LLM
+    #  頁籤 2：語音識別
+    # ─────────────────────────────────────────────
+
+    def _build_asr_tab(self, config: AppConfig) -> QWidget:
+        """建構語音識別頁籤：ASRModelTab（模型選擇） + 錄音設定群組。
+
+        ASRModelTab 本身不改動（維持單一職責只管模型選擇/下載），
+        錄音時長上限是獨立關注點，用 wrapper widget 包起嚟一齊顯示喺
+        同一分頁，唔新增分頁。
+        """
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        self._tab_asr_inner = ASRModelTab(
+            models_dir=self._models_dir,
+            current_key=config.asr.model,
+            parent=self,
+        )
+        layout.addWidget(self._tab_asr_inner)
+
+        recording_group = QGroupBox("錄音設定")
+        recording_form = QFormLayout(recording_group)
+        self._max_recording_spin = QSpinBox()
+        self._max_recording_spin.setRange(1, 999999)
+        self._max_recording_spin.setSuffix(" 秒")
+        self._max_recording_spin.setToolTip(
+            "單次錄音最長秒數，達到上限自動停止錄音並通知。"
+        )
+        recording_form.addRow("錄音時長上限：", self._max_recording_spin)
+        layout.addWidget(recording_group)
+
+        return page
+
+    # ─────────────────────────────────────────────
+    #  頁籤 3：LLM
     # ─────────────────────────────────────────────
 
     def _build_llm_tab(self) -> QWidget:
@@ -420,6 +467,14 @@ class SettingsPanel(QWidget):
             "LLM 潤色最多等幾耐。夠鐘未回完就停止潤色、直接貼未潤色原文。"
         )
         param_form.addRow("潤色逾時：", self._polish_timeout_spin)
+
+        self._min_polish_chars_spin = QSpinBox()
+        self._min_polish_chars_spin.setRange(1, 999999)
+        self._min_polish_chars_spin.setSuffix(" 字以上才潤飾")
+        self._min_polish_chars_spin.setToolTip(
+            "識別文字達到此字數先會送 LLM 潤色；未達門檻直接輸出原文，跳過潤色。"
+        )
+        param_form.addRow("字數門檻：", self._min_polish_chars_spin)
 
         self._top_p_spin = QDoubleSpinBox()
         self._top_p_spin.setRange(0.0, 1.0)
@@ -673,6 +728,9 @@ class SettingsPanel(QWidget):
         self._repolish_key_input.set_key(sc.repolish_key)
         self._repolish_instant_combo.setCurrentIndex(0 if sc.repolish_instant else 1)
 
+        self._polish_selection_key_input.set_key(sc.polish_selection_key)
+        self._polish_selection_instant_combo.setCurrentIndex(0 if sc.polish_selection_instant else 1)
+
         llm = config.llm
         # 重建置頂模型快取（各 provider 獨立，容錯讀取）
         self._pinned_store = {
@@ -696,6 +754,7 @@ class SettingsPanel(QWidget):
         self._max_tokens_spin.setValue(llm.max_tokens)
         # 舊 config 的 0（不限制）已不支援，交由 SpinBox 收斂到下限
         self._polish_timeout_spin.setValue(int(llm.polish_timeout))
+        self._min_polish_chars_spin.setValue(llm.min_polish_chars)
         self._top_p_spin.setValue(llm.top_p)
         self._freq_penalty_spin.setValue(llm.frequency_penalty)
         self._pres_penalty_spin.setValue(llm.presence_penalty)
@@ -731,6 +790,8 @@ class SettingsPanel(QWidget):
 
         # 重新潤色角色（在 RoleTab 中）
         self._tab_role.refresh_repolish_role_combo(llm.repolish_role)
+
+        self._max_recording_spin.setValue(config.audio.max_recording_seconds)
 
         out = config.output
         self._paste_mode_check.setChecked(out.paste_mode)
@@ -903,7 +964,9 @@ class SettingsPanel(QWidget):
                 ))
                 self._models_fetched.emit(provider_key, models, "")
             except Exception as err:  # noqa: BLE001 — 任何失敗都回報給 UI
-                self._models_fetched.emit(provider_key, [], str(err))
+                from utils.secrets import redact
+                # 防禦性 redact：訊息會進 log 也會顯示在設定頁
+                self._models_fetched.emit(provider_key, [], redact(str(err), api_key))
 
         import threading
         threading.Thread(target=_worker, daemon=True).start()
@@ -1114,7 +1177,11 @@ class SettingsPanel(QWidget):
             self._test_result_label.setStyleSheet(
                 "font-size: 11px; color: #d32f2f;"
             )
-            self._test_result_label.setText(f"測試異常：{err}")
+            from utils.secrets import redact
+            # 例外訊息可能含 request_uri（金鑰或被貼進 API URL 的 key）
+            self._test_result_label.setText(
+                redact(f"測試異常：{err}", self._api_key_input.text().strip()),
+            )
         finally:
             self._test_btn.setEnabled(True)
 

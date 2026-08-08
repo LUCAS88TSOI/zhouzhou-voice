@@ -220,6 +220,7 @@ class TestBug2ProcessingGuardAtomic:
 
         va = object.__new__(VoiceApp)
         va._is_processing = False
+        va._is_repolishing = False
         va._processing_lock = threading.Lock()
         va._active_workers = set()
         va._active_workers_lock = threading.Lock()
@@ -425,7 +426,7 @@ class TestBug4LLMProcessorConcurrentSafety:
             block_event.wait(timeout=3.0)
             yield "polished"
 
-        def fake_chat_with_warnings(messages, stream=True):
+        def fake_chat_with_warnings(messages, stream=True, meta=None):
             # iter 3 Bug C：新 API 返回 (generator, warnings_list)
             return fake_chat(messages, stream=stream), []
 
@@ -434,6 +435,9 @@ class TestBug4LLMProcessorConcurrentSafety:
         fake_client.param_warnings = []
         processor._client = fake_client
         processor._provider = MagicMock(model="fake-model")
+        # R3：process() 會為長輸入重建 client 以抬高 max_tokens；
+        # 這裡 provider 是 MagicMock，建真 client 會炸，故一律回 fake。
+        processor._build_client = lambda *a, **k: fake_client
 
         # 用 RLock 保護狀態（修復後應有）
         if not hasattr(processor, "_state_lock"):

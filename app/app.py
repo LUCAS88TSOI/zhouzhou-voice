@@ -12,12 +12,13 @@ import ctypes
 import sys
 import threading
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
 from app.lifecycle import LifecycleManager
-from utils.config import AppConfig, ConfigManager
+from utils.config import AppConfig, ConfigManager, LLMConfig
 from utils.logger import get_logger, setup_logging
 
 if TYPE_CHECKING:
@@ -51,6 +52,48 @@ def _merge_text_overlap_parts(parts: list[str], max_check: int = 50) -> str:
     return result
 
 
+class AsrFailure(Enum):
+    """ASR 識別失敗的原因（每種對應不同的使用者提示）。"""
+
+    NOT_READY = "not_ready"   # 模型未載入或子進程未運行
+    TIMEOUT = "timeout"       # 識別逾時
+    ERROR = "error"           # 子進程回報錯誤或發生例外
+
+
+_ASR_FAILURE_HINTS: dict[AsrFailure, str] = {
+    AsrFailure.NOT_READY: "⚠ 語音模型未載入，請到 設定 → 語音識別 下載或選擇模型",
+    AsrFailure.TIMEOUT: "⚠ 語音識別逾時，音頻已保留在錄音歷史",
+    AsrFailure.ERROR: "⚠ 語音識別失敗",
+}
+
+
+@dataclass(frozen=True)
+class AsrOutcome:
+    """
+    一次 ASR 識別的結果。
+
+    區分「識別到空白」（使用者沒出聲，正常）與「識別不可用」（真的壞了），
+    否則兩者都回 None，失敗會被靜默吞掉（R4）。
+    """
+
+    text: str = ""
+    failure: Optional[AsrFailure] = None
+    detail: str = ""
+
+    @property
+    def ok(self) -> bool:
+        """是否為成功路徑（含識別到空白）。"""
+        return self.failure is None
+
+    @property
+    def message(self) -> str:
+        """給使用者看的提示文字。"""
+        if self.failure is None:
+            return ""
+        hint = _ASR_FAILURE_HINTS[self.failure]
+        return f"{hint}：{self.detail}" if self.detail else hint
+
+
 class VoiceApp:
     """
     CC語音應用主類。
@@ -65,6 +108,10 @@ class VoiceApp:
     _RECORDER_RETRY_INTERVAL = 3.0
     _NO_MIC_HINT = "未偵測到麥克風，請接上裝置或在 Windows 聲音設定選擇輸入裝置"
 
+    # ASR 子進程崩潰後的自動重啟策略（R5）
+    _ASR_MAX_RESTARTS = 3
+    _ASR_RESTART_COOLDOWN = 30.0  # 秒
+
     def __init__(self) -> None:
         self._config: AppConfig | None = None
         self._lifecycle = LifecycleManager()
@@ -76,11 +123,15 @@ class VoiceApp:
         self._recorder_error: str | None = None
         self._recorder_retry_time: float = 0.0
         self._asr_process = None    # ASRProcess
+        # ASR 崩潰自動重啟的計數與節流（R5）
+        self._asr_restart_attempts: int = 0
+        self._asr_last_restart: float = 0.0
         self._text_processor = None # TextProcessor
 
         # Phase 3: 快捷鍵 + 輸出
         self._hotkey = None         # HotkeyListener（錄音）
         self._repolish_hotkey = None  # HotkeyListener（重新潤色，可選）
+        self._polish_selection_hotkey = None  # HotkeyListener（潤色選取文字，可選）
 
         # Phase 4: 熱詞
         self._hotword = None        # HotwordManager
@@ -99,8 +150,11 @@ class VoiceApp:
         self._last_result: str = ""
         self._last_pre_llm_text: str = ""  # LLM 前文字（供重新潤色用）
 
-        # 背景處理防重入（用 Lock 確保原子性，防止雙次觸發）
+        # 背景處理防重入（用 Lock 確保原子性，防止雙次觸發）。
+        # _processing_lock 只保護下面兩個布林，臨界區必須是微秒級：
+        # 錄音停止回調跑在 pynput 鉤子線程上，持鎖做 I/O 會讓全域快捷鍵失靈（R7）。
         self._is_processing: bool = False
+        self._is_repolishing: bool = False
         self._processing_lock = threading.Lock()
 
         # 文件轉錄 single-flight guard
@@ -205,8 +259,12 @@ class VoiceApp:
     def _initialize(self) -> None:
         """按順序初始化所有模組。"""
         # Phase 1: 基礎
-        self._config = ConfigManager.load()
+        # setup_logging 必須先於 load()：否則配置損壞的 error log 發生在
+        # handler 就緒之前，打包後既看不到 console 也不會落檔（R9）。
         setup_logging()
+        # 上次被硬殺可能留下含明文 API Key 的 .config_*.tmp
+        ConfigManager.cleanup_temp_files()
+        self._config = ConfigManager.load()
         self._lifecycle.initialize()
         self._lifecycle.register_shutdown(self._on_shutdown_save_config)
 
@@ -221,6 +279,8 @@ class VoiceApp:
         self._init_hotkey()
         self._init_repolish_hotkey()
         self._lifecycle.register_shutdown(self._stop_repolish_hotkey)
+        self._init_polish_selection_hotkey()
+        self._lifecycle.register_shutdown(self._stop_polish_selection_hotkey)
 
         # Phase 4: 熱詞
         self._init_hotword()
@@ -445,6 +505,43 @@ class VoiceApp:
             self._repolish_hotkey.stop()
             self._repolish_hotkey = None
 
+    def _make_polish_selection_hotkey(self, sc):
+        """建立潤色選取文字 HotkeyListener（不自動 start）。"""
+        from utils.hotkey import HotkeyListener
+
+        if sc.polish_selection_instant:
+            # 速發模式：鬆開時觸發
+            return HotkeyListener(
+                key=sc.polish_selection_key,
+                threshold=0.05,  # 最小閾值防抖
+                suppress=False,
+                on_activate=None,
+                on_deactivate=self._on_polish_selection_activate,
+            )
+        else:
+            # 長按模式：長按觸發
+            return HotkeyListener(
+                key=sc.polish_selection_key,
+                threshold=sc.threshold,
+                suppress=False,
+                on_activate=self._on_polish_selection_activate,
+                on_deactivate=None,
+            )
+
+    def _init_polish_selection_hotkey(self) -> None:
+        """初始化潤色選取文字快捷鍵（停用時直接返回）。"""
+        if not self._config.shortcut.polish_selection_key:
+            return
+        self._polish_selection_hotkey = self._make_polish_selection_hotkey(self._config.shortcut)
+        self._polish_selection_hotkey.start()
+        logger.info("潤色選取文字快捷鍵已啟動: %s", self._config.shortcut.polish_selection_key)
+
+    def _stop_polish_selection_hotkey(self) -> None:
+        """停止潤色選取文字快捷鍵監聽（lifecycle 清理用）。"""
+        if self._polish_selection_hotkey is not None:
+            self._polish_selection_hotkey.stop()
+            self._polish_selection_hotkey = None
+
     def _init_hotword(self) -> None:
         """初始化熱詞系統。"""
         if not self._config.hotword.enabled:
@@ -518,6 +615,15 @@ class VoiceApp:
             # 不顯示主窗口（最小化到托盤）
             tray.show()
             tray.show_message("CC語音", "已啟動，按住 CapsLock 說話")
+
+            # 設定檔損壞已回退預設值 → 必須讓用戶知道，否則 API Key
+            # 憑空消失卻毫無線索（R9）
+            if ConfigManager.load_failed():
+                backup = ConfigManager.quarantine_path()
+                hint = "設定檔損壞，已重置為預設值"
+                if backup:
+                    hint += f"\n原檔已備份於：{backup}"
+                self._invoke_gui("notify_warning", (str, hint))
 
             # 背景檢查是否有新版本
             self._init_updater()
@@ -679,6 +785,63 @@ class VoiceApp:
             return
         self._spawn_worker(self._run_repolish, name="repolish-worker")
 
+    def _on_polish_selection_activate(self) -> None:
+        """潤色選取文字快捷鍵觸發：在背景線程讀取選取文字並重新潤色。"""
+        if self._recorder is not None and self._recorder.is_recording:
+            return
+        self._spawn_worker(self._run_polish_selection, name="polish-selection-worker")
+
+    def _run_polish_selection(self) -> None:
+        """背景線程：讀取當前選取文字、LLM 潤色、貼回覆蓋選取範圍。"""
+        from utils.clipboard import ClipboardManager
+
+        # single-flight：防止與錄音/重新潤色併發（不阻塞、不等待）
+        if not self._begin_exclusive():
+            logger.info("已有處理進行中，忽略本次潤色選取文字")
+            return
+        final_status = "完成"
+        try:
+            selected = ClipboardManager.capture_selection()
+            if not selected:
+                final_status = ""  # 未偵測到選取文字：唔改動狀態列，淨係托盤氣泡通知
+                self._invoke_gui("notify_warning", (str, "未偵測到選取文字"))
+                return
+            # 只記長度不記內容：選取文字來自使用者當下的剪貼板，可能是密碼
+            # 或其他敏感資料，寫進 app.log 等同外洩（使用者常把 log 貼上 issue）
+            logger.info("潤色選取文字開始: %d 個字元", len(selected))
+
+            llm_processor, repolish_role = self._build_repolish_processor()
+            if llm_processor is None:
+                final_status = "未配置 LLM"
+                self._invoke_gui("set_status", (str, final_status))
+                return
+
+            self._invoke_gui("set_status", (str, "LLM 處理中..."))
+            result = self._try_llm_polish(selected, role_override=repolish_role, llm_processor=llm_processor)
+            polished = result.text
+            if not result.success:
+                self._invoke_gui(
+                    "notify_warning",
+                    (str, "⚠ 潤色選取文字失敗（請檢查網絡或 API Key）"),
+                )
+
+            logger.info("潤色選取文字結果: %d 個字元", len(polished))
+            self._invoke_gui("append_result", (str, f"[潤色選取] {polished}"))
+
+            restore = self._config.output.restore_clip if self._config else False
+            if not ClipboardManager.paste_text(polished, restore=restore):
+                self._invoke_gui(
+                    "notify_warning",
+                    (str, "⚠ 貼上失敗，結果已喺剪貼板，可手動 Ctrl+V"),
+                )
+        except Exception as err:
+            logger.error("潤色選取文字異常: %s", err, exc_info=True)
+            final_status = "失敗"
+        finally:
+            self._end_exclusive()
+            if final_status:
+                self._invoke_gui("set_status", (str, final_status))
+
     def _build_repolish_processor(self) -> tuple:
         """建立重新潤色用的 LLM 處理器和角色 ID。
 
@@ -757,10 +920,32 @@ class VoiceApp:
             logger.error("即場建立重新潤色 LLM 處理器失敗: %s", err)
             return None
 
+    def _begin_exclusive(self) -> bool:
+        """
+        搶占「重新潤色 / 潤色選取文字」的獨佔權（single-flight）。
+
+        持鎖區段只做布林檢查與設定（微秒級），LLM I/O 一律在鎖外進行 —— 否則
+        會把阻塞等鎖的 pynput 鉤子線程卡住數十秒（R7）。
+
+        Returns:
+            True 表示搶到，呼叫者必須在 finally 呼叫 _end_exclusive()
+        """
+        with self._processing_lock:
+            if self._is_processing or self._is_repolishing:
+                return False
+            self._is_repolishing = True
+            return True
+
+    def _end_exclusive(self) -> None:
+        """釋放獨佔權（必須在 finally 呼叫）。"""
+        with self._processing_lock:
+            self._is_repolishing = False
+
     def _run_repolish(self) -> None:
         """背景線程：對 _last_result 重新執行 LLM 潤色並貼上。"""
-        # Lock 防止雙次觸發（非阻塞嘗試，acquire/release 同在此線程）
-        if not self._processing_lock.acquire(blocking=False):
+        # single-flight：搶不到就直接放棄（不阻塞、不等待）
+        if not self._begin_exclusive():
+            logger.info("已有處理進行中，忽略本次重新潤色")
             return
         final_status = "完成"
         try:
@@ -799,7 +984,7 @@ class VoiceApp:
             logger.error("重新潤色異常: %s", err, exc_info=True)
             final_status = "失敗"
         finally:
-            self._processing_lock.release()
+            self._end_exclusive()
             self._invoke_gui("set_status", (str, final_status))
 
     def _on_history_reprocess(self, record_id: int, role_id: str) -> None:
@@ -880,10 +1065,12 @@ class VoiceApp:
             self._invoke_gui("set_status", (str, "就緒"))
             return
 
-        # Atomic check-and-set：同一把鎖內完成「guard 檢查 + 搶占」
+        # Atomic check-and-set：同一把鎖內完成「guard 檢查 + 搶占」。
+        # 本方法跑在 pynput listener thread（擁有 WH_KEYBOARD_LL 鉤子那條），
+        # 所以這段臨界區必須是微秒級 —— 任何 I/O 都不得在持鎖時進行（R7）。
         with self._processing_lock:
-            if self._is_processing:
-                logger.warning("上一次語音還在處理中，忽略本次")
+            if self._is_processing or self._is_repolishing:
+                logger.warning("上一次處理還在進行中，忽略本次")
                 return
             self._is_processing = True
 
@@ -933,11 +1120,23 @@ class VoiceApp:
                     "長音頻 %.1fs > %.0fs，啟用分段識別",
                     rec_duration, long_threshold,
                 )
-                text = self._recognize_long_audio(audio_bytes)
+                outcome = self._recognize_long_audio(audio_bytes)
             else:
-                text = self._try_recognize(audio_bytes)
+                outcome = self._try_recognize(audio_bytes)
             timings["ASR"] = time.monotonic() - t
 
+            # ASR 不可用 → 必須讓使用者看見，否則核心功能整個死掉但
+            # 狀態列仍顯示「就緒」，使用者只會反覆重講（R4）
+            if not outcome.ok:
+                self._last_result = ""
+                self._last_pre_llm_text = ""
+                self._invoke_gui("notify_warning", (str, outcome.message))
+                self._invoke_gui("append_result", (str, outcome.message))
+                self._print_timings(rec_duration, timings, final_text=None)
+                final_status = "失敗"
+                return
+
+            text = outcome.text
             if not text or not text.strip():
                 self._last_result = ""
                 self._last_pre_llm_text = ""
@@ -973,10 +1172,10 @@ class VoiceApp:
                 return
 
             # ── 5. LLM 潤色（可選，短文本跳過）──────────────
-            _MIN_LLM_LENGTH = 4  # 少於此字符數不調用 LLM（即 3 字以下跳過）
-            skip_llm = len(text.strip()) < _MIN_LLM_LENGTH
+            min_chars = self._config.llm.min_polish_chars if self._config else LLMConfig().min_polish_chars
+            skip_llm = len(text.strip()) < min_chars
             if skip_llm:
-                logger.debug("短文本跳過 LLM: %r (%d 字符)", text, len(text.strip()))
+                logger.debug("短文本跳過 LLM: %r (%d 字符，門檻 %d)", text, len(text.strip()), min_chars)
 
             self._last_pre_llm_text = text
 
@@ -1126,11 +1325,60 @@ class VoiceApp:
             repr(final_text[:50]) if final_text else "無",
         )
 
-    def _try_recognize(self, audio_bytes: bytes) -> Optional[str]:
-        """發送音頻到 ASR 子進程進行識別。"""
-        if self._asr_process is None or not self._asr_process.is_running:
+    def _ensure_asr(self) -> bool:
+        """
+        確保 ASR 子進程可用；已死則嘗試重啟（比照 _ensure_recorder 熱插拔）。
+
+        子進程崩潰後原本永遠不會重啟，語音輸入永久失效直到使用者自己
+        重開程式，而托盤圖示照常亮著（R5）。
+
+        注意：restart() 內部阻塞最長 120 秒，只能在 worker 線程呼叫。
+
+        Returns:
+            True 表示可用（或重啟成功）
+        """
+        if self._asr_process is None:
+            return False
+        if self._asr_process.is_running:
+            self._asr_restart_attempts = 0
+            return True
+
+        if self._asr_restart_attempts >= self._ASR_MAX_RESTARTS:
+            logger.error("ASR 重啟已達上限 %d 次，不再嘗試", self._ASR_MAX_RESTARTS)
+            return False
+
+        elapsed = time.monotonic() - self._asr_last_restart
+        if elapsed < self._ASR_RESTART_COOLDOWN:
+            logger.warning("ASR 重啟節流中（距上次 %.0fs）", elapsed)
+            return False
+
+        self._asr_restart_attempts += 1
+        self._asr_last_restart = time.monotonic()
+        logger.warning("ASR 子進程已停止，嘗試重啟（第 %d 次）", self._asr_restart_attempts)
+        self._invoke_gui("set_status", (str, "語音模型重啟中..."))
+
+        try:
+            self._asr_process.restart()
+        except Exception as err:
+            logger.error("ASR 重啟失敗: %s", err, exc_info=True)
+            self._invoke_gui("notify_warning", (str, f"⚠ 語音模型重啟失敗：{err}"))
+            return False
+
+        logger.info("ASR 子進程重啟成功")
+        self._asr_restart_attempts = 0
+        return True
+
+    def _try_recognize(self, audio_bytes: bytes) -> AsrOutcome:
+        """
+        發送音頻到 ASR 子進程進行識別。
+
+        回傳 AsrOutcome 而非 Optional[str]：呼叫端要能區分「識別到空白」
+        （使用者沒出聲）與「識別不可用」（真的壞了），否則失敗會被靜默
+        吞掉，狀態列還顯示「就緒」（R4）。
+        """
+        if not self._ensure_asr():
             logger.warning("ASR 未就緒，語音識別不可用")
-            return None
+            return AsrOutcome(failure=AsrFailure.NOT_READY)
 
         try:
             from core.asr_process import ASRRequest, new_task_id
@@ -1149,23 +1397,23 @@ class VoiceApp:
 
             if response.error:
                 logger.error("ASR 識別錯誤: %s", response.error)
-                return None
+                return AsrOutcome(failure=AsrFailure.ERROR, detail=response.error)
 
             if not response.text:
                 logger.info("未識別到語音內容")
-                return None
+                return AsrOutcome(text="")
 
             logger.info("ASR 識別: %s", response.text)
-            return response.text
+            return AsrOutcome(text=response.text)
 
         except TimeoutError:
             logger.error("ASR 識別超時")
-            return None
+            return AsrOutcome(failure=AsrFailure.TIMEOUT)
         except Exception as err:
             logger.error("ASR 識別異常: %s", err, exc_info=True)
-            return None
+            return AsrOutcome(failure=AsrFailure.ERROR, detail=str(err))
 
-    def _recognize_long_audio(self, audio_bytes: bytes) -> Optional[str]:
+    def _recognize_long_audio(self, audio_bytes: bytes) -> AsrOutcome:
         """長音頻分段識別 → 文字拼接。
 
         將 float32 PCM 按 audio.segment_seconds 切片，串行送 ASR 子進程，
@@ -1175,11 +1423,11 @@ class VoiceApp:
             audio_bytes: float32 PCM bytes（16kHz 單聲道）
 
         Returns:
-            拼接後的識別文字；任一段失敗仍嘗試後續段，全部失敗返回 None
+            AsrOutcome；任一段失敗仍嘗試後續段，全部失敗則帶回最後一個失敗原因
         """
-        if self._asr_process is None or not self._asr_process.is_running:
+        if not self._ensure_asr():
             logger.warning("ASR 未就緒，無法分段識別")
-            return None
+            return AsrOutcome(failure=AsrFailure.NOT_READY)
 
         import numpy as np
 
@@ -1218,6 +1466,7 @@ class VoiceApp:
         )
 
         parts: list[str] = []
+        last_failure: Optional[AsrOutcome] = None
         for idx, (start, end) in enumerate(slices, 1):
             self._invoke_gui(
                 "set_status",
@@ -1225,18 +1474,24 @@ class VoiceApp:
             )
             seg_arr = audio_arr[start:end]
             seg_bytes = seg_arr.tobytes()  # 已是 float32，無需轉型
-            seg_text = self._try_recognize(seg_bytes)
-            if seg_text:
-                parts.append(seg_text.strip())
+            seg_outcome = self._try_recognize(seg_bytes)
+            if not seg_outcome.ok:
+                last_failure = seg_outcome
+                logger.warning(
+                    "分段 %d/%d 識別失敗: %s", idx, total_segs, seg_outcome.message,
+                )
+            elif seg_outcome.text:
+                parts.append(seg_outcome.text.strip())
             else:
-                logger.warning("分段 %d/%d 識別失敗或為空", idx, total_segs)
+                logger.info("分段 %d/%d 無語音內容", idx, total_segs)
 
         if not parts:
-            return None
+            # 全部段落都沒產出：有失敗就回報失敗，否則是真的沒聲音
+            return last_failure or AsrOutcome(text="")
 
         merged = _merge_text_overlap_parts(parts)
         logger.info("分段識別完成: %d 段拼接 → %d 字", total_segs, len(merged))
-        return merged
+        return AsrOutcome(text=merged)
 
     def _try_llm_polish(
         self, text: str, role_override: str = "", llm_processor=None,
@@ -1308,6 +1563,23 @@ class VoiceApp:
                     text=text,
                     was_processed=True,
                     error="潤色逾時",
+                )
+
+            # 撞到 max_tokens 上限 → 丟棄半截潤色，回傳原文
+            # 寧可不潤色，也不要讓使用者後半段講的話憑空消失
+            if result.truncated:
+                logger.warning(
+                    "LLM 回覆被截斷（max_tokens 不足），貼出未潤色原文",
+                )
+                self._invoke_gui(
+                    "notify_warning",
+                    (str, "潤色結果被截斷，已貼出未潤色原文\n請到 設定 → LLM 調高 Max Tokens"),
+                )
+                return LLMResultStatus(
+                    success=False,
+                    text=text,
+                    was_processed=True,
+                    error="潤色回覆被 max_tokens 截斷",
                 )
 
             # 有錯誤 → 顯示到主視窗讓用戶知道
@@ -1642,25 +1914,17 @@ class VoiceApp:
         """
         old_config = self._config
 
-        # 1. 先嘗試不可逆操作：ASR 重啟或重建
+        # 1. 先嘗試不可逆操作：ASR 模型切換必須重建子進程
+        #    AudioConfig（max_recording_seconds/long_audio_threshold/segment_seconds/
+        #    segment_overlap）四個欄位只在主進程使用，從未傳進 ASR 子進程
+        #    （core/asr_process.py 的 ASRProcess() 建構只吃 model_dir/model_info），
+        #    故 audio 欄位變更不需要、也不應該觸發 ASR restart（v3.9.3 移除誤觸發）。
         asr_changed = old_config.asr != new_config.asr
-        audio_changed = old_config.audio != new_config.audio
 
         if asr_changed:
             # 模型切換：必須 stop + _init_asr() 重建（restart 不會換模型）
             if not self._apply_config_recreate_asr(new_config):
                 return  # 重建失敗，配置未變更
-        elif audio_changed:
-            if self._asr_process and self._asr_process.is_running:
-                logger.info("ASR 音頻配置變更，重啟 ASR 子進程...")
-                self._invoke_gui("set_status", (str, "ASR 模型重啟中..."))
-                try:
-                    self._asr_process.restart()
-                except Exception as exc:
-                    logger.error("ASR 重啟失敗，配置未變更: %s", exc)
-                    self._invoke_gui("set_status", (str, "ASR 重啟失敗，配置未變更"))
-                    return  # 不 raise，不 commit，所有子系統保持原狀
-                self._invoke_gui("set_status", (str, "就緒"))
 
         # 2. ASR 成功（或不需要重啟）→ 提交配置
         self._config = new_config
@@ -1693,6 +1957,20 @@ class VoiceApp:
                     self._repolish_hotkey.start()
                     logger.info("重新潤色快捷鍵已更新: %s", new_config.shortcut.repolish_key)
 
+            # 潤色選取文字鍵 / 模式 / 閾值 — 任一變更都重建 listener
+            old_ps = (old_config.shortcut.polish_selection_key,
+                      old_config.shortcut.polish_selection_instant,
+                      old_config.shortcut.threshold)
+            new_ps = (new_config.shortcut.polish_selection_key,
+                      new_config.shortcut.polish_selection_instant,
+                      new_config.shortcut.threshold)
+            if old_ps != new_ps:
+                self._stop_polish_selection_hotkey()
+                if new_config.shortcut.polish_selection_key:
+                    self._polish_selection_hotkey = self._make_polish_selection_hotkey(new_config.shortcut)
+                    self._polish_selection_hotkey.start()
+                    logger.info("潤色選取文字快捷鍵已更新: %s", new_config.shortcut.polish_selection_key)
+
         # 4. 更新 LLM 處理器（如果配置改變了）
         if old_config.llm != new_config.llm:
             if self._llm is not None:
@@ -1713,15 +1991,30 @@ class VoiceApp:
             if self._hotword:
                 self._hotword.reload(new_config.hotword)
                 logger.info("熱詞管理器已重新載入")
+            elif new_config.hotword.enabled:
+                # 停用後再啟用：manager 是 None，必須重建（對稱於第 4 步的 LLM）。
+                # 缺這個分支時熱詞分頁會變成永久死頁，重啟程式才能救（R14）。
+                self._init_hotword()
+                logger.info("熱詞管理器已新建")
+            # 重建或關閉都要同步給 UI，否則分頁仍握著舊的（或 None）引用
+            self._invoke_gui("set_hotword_manager", (object, self._hotword))
 
-        # 7. 更新托盤角色選單
+        # 7. 更新錄音器時長上限（如果改變了）
+        #    只更新既有 AudioRecorder 實例的上限，下次 start_recording() 生效；
+        #    唔會截斷正在錄緊嘅內容（set_max_duration 只改欄位，唔會中止當前錄音）。
+        if old_config.audio.max_recording_seconds != new_config.audio.max_recording_seconds:
+            if self._recorder:
+                self._recorder.set_max_duration(new_config.audio.max_recording_seconds)
+                logger.info("錄音時長上限已更新: %.0f 秒", new_config.audio.max_recording_seconds)
+
+        # 8. 更新托盤角色選單
         if old_config.llm.active_role != new_config.llm.active_role or \
                 old_config.llm.custom_roles != new_config.llm.custom_roles or \
                 old_config.llm.builtin_overrides != new_config.llm.builtin_overrides:
             self._refresh_tray_roles()
             logger.info("角色已切換: %s", new_config.llm.active_role)
 
-        # 8. 桌面浮窗顯示開關變更 → 即時重建（不需重啟程式）
+        # 9. 桌面浮窗顯示開關變更 → 即時重建（不需重啟程式）
         if old_config.ui.show_indicator != new_config.ui.show_indicator:
             self._invoke_gui("rebuild_recording_indicator")
             logger.info("桌面浮窗顯示設定已變更: %s", new_config.ui.show_indicator)

@@ -134,6 +134,33 @@ class KeyboardSimulator:
             return False
 
     @classmethod
+    def press_ctrl_c(cls) -> bool:
+        """
+        模擬 Ctrl+C（複製）。
+
+        用於讀取當前選取文字，配合 ClipboardManager.capture_selection() 使用。
+
+        Returns:
+            是否成功（pynput 初始化或按鍵模擬失敗時回 False，不冒泡）
+        """
+        from pynput.keyboard import Key
+
+        try:
+            ctrl = cls._get_controller()
+            ctrl.press(Key.ctrl_l)
+            time.sleep(0.01)
+            ctrl.press("c")
+            time.sleep(0.01)
+            ctrl.release("c")
+            ctrl.release(Key.ctrl_l)
+            time.sleep(0.05)  # 等待複製完成
+            logger.debug("已模擬 Ctrl+C")
+            return True
+        except Exception as err:  # noqa: BLE001 — 任何失敗都回報，避免靜默冒泡
+            logger.error("模擬 Ctrl+C 失敗: %s", err, exc_info=True)
+            return False
+
+    @classmethod
     def type_text(cls, text: str, interval: float = 0.01) -> None:
         """
         逐字打字（備援方案）。

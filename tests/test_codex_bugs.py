@@ -96,76 +96,12 @@ class TestBug2HotwordReloadTypo:
             raise
 
 
-# ─── Bug 3: ASR config committed before restart ──────────────
-
-
-class TestBug3ASRConfigRollback:
-    """_apply_config() attempts ASR restart BEFORE committing config.
-    If restart fails, the method returns gracefully without changing
-    any state (no raise, no config mutation, no subsystem updates).
-    This prevents partial state inconsistency and avoids crashing
-    Qt signal handlers that silently swallow exceptions.
-    """
-
-    def test_apply_config_no_mutation_on_asr_restart_failure(self):
-        """When ASR restart fails, _config must remain old_config
-        and the broken config must NOT be persisted.
-        The method must NOT raise (Qt signal handler swallows exceptions).
-        """
-        from app.app import VoiceApp
-
-        va = object.__new__(VoiceApp)
-        VoiceApp.__init__(va)
-
-        old_config = MagicMock()
-        old_config.shortcut = MagicMock()
-        old_config.shortcut.key = "caps_lock"
-        old_config.shortcut.threshold = 0.3
-        old_config.shortcut.suppress = False
-        old_config.shortcut.repolish_key = ""
-        old_config.shortcut.repolish_instant = False
-        old_config.llm = MagicMock()
-        old_config.output = MagicMock()
-        old_config.hotword = MagicMock()
-        old_config.asr = MagicMock(name="shared_asr")
-        old_config.audio = MagicMock()
-
-        new_config = MagicMock()
-        new_config.shortcut = old_config.shortcut
-        new_config.llm = old_config.llm
-        new_config.output = old_config.output
-        new_config.hotword = old_config.hotword
-        new_config.asr = old_config.asr  # asr unchanged -> audio-only branch
-        # Only audio differs -> triggers restart
-        new_config.audio = MagicMock()
-
-        va._config = old_config
-        va._hotkey = None
-        va._llm = None
-        va._hotword = None
-
-        # Mock ASR process that fails on restart
-        mock_asr = MagicMock()
-        mock_asr.is_running = True
-        mock_asr.restart.side_effect = RuntimeError("Model files missing")
-        va._asr_process = mock_asr
-
-        mock_invoke = MagicMock()
-        va._invoke_gui = mock_invoke
-
-        with patch("app.app.ConfigManager") as MockCfgMgr:
-            # _apply_config must NOT raise (graceful return instead)
-            va._apply_config(new_config)
-
-            # Config must remain old_config (never mutated)
-            assert va._config is old_config, (
-                "Bug 3: _config was mutated despite ASR restart failure"
-            )
-
-            # ConfigManager.save must NOT have been called at all
-            # (since we never committed the new config)
-            MockCfgMgr.save.assert_not_called()
-
+# ─── Bug 3（v3.9.3 已退役）───────────────────────────────────
+# 原 TestBug3ASRConfigRollback 測嘅係「asr 未變、只有 audio 變 -> 觸發
+# restart -> 失敗 -> config 唔變」。呢個 audio_changed 分支已經喺
+# _apply_config() 移除（AudioConfig 四個欄位對 ASR 子進程無影響）。
+# 「不可逆操作失敗時唔 mutate 其他子系統」呢個安全性質而家由
+# tests/test_apply_config_rollback.py 嘅 T1-T7（改用 asr_changed 觸發）覆蓋。
 
 # ─── Bug 4: Segment merge drops non-overlapping text ─────────
 

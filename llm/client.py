@@ -25,6 +25,7 @@ import urllib3
 
 from llm.provider import ProviderInfo
 from utils.logger import get_logger
+from utils.secrets import redact, safe_url
 
 logger = get_logger("llm.client")
 
@@ -172,7 +173,7 @@ class LLMClient:
 
         logger.info(
             "LLMClient 初始化: endpoint=%s, model=%s, temp=%.2f, max_tokens=%d",
-            self._endpoint,
+            safe_url(self._endpoint),
             provider.model,
             temperature,
             max_tokens,
@@ -215,6 +216,7 @@ class LLMClient:
         self,
         messages: list[dict[str, str]],
         stream: bool = True,
+        meta: dict[str, Any] | None = None,
     ) -> tuple[Generator[str, None, None], list[str]]:
         """
         串流模式 per-call 版本：返回 (generator, warnings_list)。
@@ -225,6 +227,10 @@ class LLMClient:
         容錯重試：若 HTTP 400 錯誤，自動移除不支援的可選參數後重試一次；
         重試時的警告會 append 到返回的 warnings_list。
 
+        Args:
+            meta: 若給定，generator 耗盡後會寫入 meta["finish_reason"]，
+                  讓呼叫端能偵測 max_tokens 截斷。
+
         Returns:
             (generator, warnings_list)
             - generator: 逐 chunk yield 文字
@@ -234,7 +240,7 @@ class LLMClient:
             RuntimeError: HTTP 請求失敗、超時或解析錯誤時拋出
         """
         warnings: list[str] = []
-        gen = self._stream_chat_impl(messages, stream, warnings)
+        gen = self._stream_chat_impl(messages, stream, warnings, meta)
         return gen, warnings
 
     def _stream_chat_impl(
@@ -242,6 +248,7 @@ class LLMClient:
         messages: list[dict[str, str]],
         stream: bool,
         warnings: list[str],
+        meta: dict[str, Any] | None = None,
     ) -> Generator[str, None, None]:
         """內部實作：串流 chat，把警告 append 到外部傳入的 list。"""
         request = self._build_chat_request(messages, stream)
@@ -265,7 +272,7 @@ class LLMClient:
                 ),
             )
         except urllib3.exceptions.HTTPError as err:
-            msg = f"網路連線失敗：{err}"
+            msg = redact(f"網路連線失敗：{err}", self._provider.api_key)
             logger.error(msg)
             raise RuntimeError(msg)
         except (socket.timeout, TimeoutError):
@@ -293,7 +300,7 @@ class LLMClient:
                         timeout=urllib3.Timeout(connect=10, read=self._timeout),
                     )
                 except urllib3.exceptions.HTTPError as err:
-                    msg = f"網路連線失敗：{err}"
+                    msg = redact(f"網路連線失敗：{err}", self._provider.api_key)
                     logger.error(msg)
                     raise RuntimeError(msg)
                 except (socket.timeout, TimeoutError):
@@ -304,7 +311,7 @@ class LLMClient:
         # 檢查 HTTP 狀態碼
         if response.status != 200:
             body = self._read_response_body(response)
-            body = body.replace(self._provider.api_key, "[REDACTED]")
+            body = redact(body, self._provider.api_key)
             response.release_conn()
 
             if response.status == 401:
@@ -312,7 +319,7 @@ class LLMClient:
             elif response.status == 403:
                 msg = "權限不足（HTTP 403）"
             elif response.status == 404:
-                msg = f"API 端點不存在（HTTP 404）：{self._endpoint}"
+                msg = f"API 端點不存在（HTTP 404）：{safe_url(self._endpoint)}"
             elif response.status == 429:
                 msg = "請求過於頻繁或配額用盡（HTTP 429）"
             elif response.status >= 500:
@@ -324,7 +331,7 @@ class LLMClient:
             raise RuntimeError(msg)
 
         try:
-            yield from self._parse_sse_stream(response)
+            yield from self._parse_sse_stream(response, meta)
         except Exception as err:
             msg = f"串流解析錯誤：{err}"
             logger.error(msg)
@@ -418,7 +425,7 @@ class LLMClient:
 
         if response.status != 200:
             body = response.data.decode("utf-8", errors="replace")[:500]
-            body = body.replace(self._provider.api_key, "[REDACTED]")
+            body = redact(body, self._provider.api_key)
             logger.error("HTTP %d 錯誤: %s", response.status, body)
             return ""
 
@@ -467,7 +474,7 @@ class LLMClient:
             )
         except urllib3.exceptions.HTTPError as err:
             elapsed = time.perf_counter() - start
-            return False, f"連線失敗：{err}", elapsed
+            return False, redact(f"連線失敗：{err}", self._provider.api_key), elapsed
         except (socket.timeout, TimeoutError):
             elapsed = time.perf_counter() - start
             return False, f"連線超時（{timeout} 秒）：請檢查網路或 API URL", elapsed
@@ -475,7 +482,7 @@ class LLMClient:
         elapsed = time.perf_counter() - start
         body = response.data.decode("utf-8", errors="replace")
         # 防止 API 回應中意外洩露 API Key
-        body = body.replace(self._provider.api_key, "[REDACTED]")
+        body = redact(body, self._provider.api_key)
 
         # 4xx：回應 body 由第三方端點控制，可能含 PII 或截斷／變形的 key，
         # 故只寫入（已 redact 的）log 供 debug，UI 一律用固定文案，避免敏感資料外洩。
@@ -581,7 +588,9 @@ class LLMClient:
         return f"{base}{_CHAT_COMPLETIONS_PATH}"
 
     @staticmethod
-    def _parse_sse_stream(response: Any) -> Generator[str, None, None]:
+    def _parse_sse_stream(
+        response: Any, meta: dict[str, Any] | None = None,
+    ) -> Generator[str, None, None]:
         """
         解析 SSE 串流回應。
 
@@ -590,6 +599,11 @@ class LLMClient:
             data: [DONE]
 
         每行以 "data: " 開頭，解析 JSON 並提取 delta.content。
+
+        Args:
+            meta: 若給定，串流結束時寫入 meta["finish_reason"]。
+                  呼叫端據此判斷回覆是否被 max_tokens 截斷（"length"），
+                  否則半截文字會被當成完整結果貼出去。
         """
         for raw_line in response:
             line = raw_line.decode("utf-8", errors="replace").strip()
@@ -611,6 +625,11 @@ class LLMClient:
             except json.JSONDecodeError:
                 logger.debug("SSE 行 JSON 解析跳過: %s", data_str[:80])
                 continue
+
+            if meta is not None:
+                reason = _extract_finish_reason(data)
+                if reason:
+                    meta["finish_reason"] = reason
 
             content = _extract_delta_content(data)
             if content:
@@ -673,3 +692,12 @@ def _extract_delta_content(data: dict[str, Any]) -> str:
 
     delta = choices[0].get("delta", {})
     return delta.get("content", "") or ""
+
+
+def _extract_finish_reason(data: dict[str, Any]) -> str:
+    """從 SSE JSON 中提取 choices[0].finish_reason（中途 chunk 為 null）。"""
+    choices = data.get("choices")
+    if not choices or not isinstance(choices, list):
+        return ""
+
+    return choices[0].get("finish_reason") or ""

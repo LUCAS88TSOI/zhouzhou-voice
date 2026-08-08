@@ -202,6 +202,7 @@ class TestF8HotkeyConfigApply:
         va._config = old_cfg
         va._hotkey = mock_hotkey
         va._repolish_hotkey = None
+        va._polish_selection_hotkey = None
         va._llm = None
         va._main_window = None
         va._recording_db = None

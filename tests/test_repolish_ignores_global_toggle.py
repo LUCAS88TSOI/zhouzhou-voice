@@ -122,6 +122,8 @@ class TestRepolishWhenGlobalToggleOff:
         唔止『唔顯示未配置』，而係實際打咗出去並攞到潤色結果。"""
         va = _make_app(_off_config(), llm_instance=None)
         va._processing_lock = threading.Lock()
+        va._is_processing = False
+        va._is_repolishing = False
         va._last_result = "原始文字"
         va._last_pre_llm_text = "原始文字"
         va._hotword = None
@@ -234,6 +236,8 @@ class TestRepolishProcessorEdgeCases:
         唔好貼返原文扮完成。"""
         va = _make_app(_off_config(providers={}), llm_instance=None)
         va._processing_lock = threading.Lock()
+        va._is_processing = False
+        va._is_repolishing = False
         va._last_result = "原始文字"
         va._last_pre_llm_text = "原始文字"
 

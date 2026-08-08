@@ -59,7 +59,7 @@ class TestBug3ClearHistoryEpochRace:
             block.wait(timeout=3.0)
             yield "new-assistant-reply"
 
-        def fake_chat_with_warnings(messages, stream=True):
+        def fake_chat_with_warnings(messages, stream=True, meta=None):
             # iter 3 Bug C：新 per-call API 回傳 (generator, warnings_list)
             return fake_chat(messages, stream=stream), []
 
@@ -68,6 +68,8 @@ class TestBug3ClearHistoryEpochRace:
         fake_client.param_warnings = []
         processor._client = fake_client
         processor._provider = MagicMock(model="fake-model")
+        # R3：同 iter1，避免 process() 重建 client 時撞上 MagicMock provider
+        processor._build_client = lambda *a, **k: fake_client
         return processor
 
     def test_history_epoch_attribute_exists(self):

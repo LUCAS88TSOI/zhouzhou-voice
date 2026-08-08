@@ -84,8 +84,9 @@ def test_fetch_models_missing_key_raises():
 def test_fetch_models_google_uses_google_adapter(monkeypatch):
     seen = {}
 
-    def fake_get(url, headers, timeout):
+    def fake_get(url, headers, timeout, secret=None):
         seen["url"] = url
+        seen["headers"] = headers
         return {"models": [{"name": "models/gemini-2.5-flash",
                             "supportedGenerationMethods": ["generateContent"]}]}
 
@@ -94,7 +95,9 @@ def test_fetch_models_google_uses_google_adapter(monkeypatch):
                      api_url="https://g.test/v1beta", api_key="AIzaKEY",
                      model="", enabled=True)
     assert mf.fetch_models(p) == ["gemini-2.5-flash"]
-    assert "key=AIzaKEY" in seen["url"]  # google 用 query 認證
+    # google 改走 header 認證，金鑰不得出現在 URL（否則例外訊息會帶進 log）
+    assert "AIzaKEY" not in seen["url"]
+    assert seen["headers"]["x-goog-api-key"] == "AIzaKEY"
 
 
 # ─── A4: 快取 TTL ─────────────────────────────────────────
@@ -159,7 +162,9 @@ def test_failover_aborts_when_deadline_reached(monkeypatch):
     monkeypatch.setattr(proc_mod, "list_available_providers",
                         lambda cfg: fake_provs)
     calls = []
-    monkeypatch.setattr(p, "_build_client", lambda prov, timeout=None: object())
+    monkeypatch.setattr(
+        p, "_build_client", lambda prov, timeout=None, max_tokens=None: object()
+    )
     monkeypatch.setattr(p, "_stream_chat",
                         lambda **kw: calls.append(1) or LLMResult(error="連線逾時"))
 
@@ -183,7 +188,9 @@ def test_failover_tries_provider_when_time_left(monkeypatch):
     ]
     monkeypatch.setattr(proc_mod, "list_available_providers",
                         lambda cfg: fake_provs)
-    monkeypatch.setattr(p, "_build_client", lambda prov, timeout=None: object())
+    monkeypatch.setattr(
+        p, "_build_client", lambda prov, timeout=None, max_tokens=None: object()
+    )
     monkeypatch.setattr(p, "_stream_chat",
                         lambda **kw: LLMResult(text="ok"))
 

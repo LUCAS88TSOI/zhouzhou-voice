@@ -41,6 +41,35 @@ _WEAK_PUNC = set("，,、；;")
 # 行字數閾值：弱標點超過此長度才換行
 _LINE_THRESHOLD = 15
 
+# 單行字數硬上限：無標點來源（如 sensevoice-yue use_itn=False）靠標點切不開，
+# 超過此長度一律強制切分，否則整份 SRT 只會產出一條蓋滿畫面的字幕。
+_MAX_LINE_CHARS = 20
+
+# 強制切分時，前段至少要有 limit 的這個比例，避免切出一兩個字的碎行
+_MIN_CUT_RATIO = 0.5
+
+# 單條字幕時長上限（秒）；超過則依 words 時間戳缺口二次切分。
+# 7 秒是字幕慣例上限（觀眾一眼能讀完），也避免把只超標一點的句子切碎。
+_MAX_SUBTITLE_DURATION = 7.0
+
+# 短於此字數的字幕不再二次切分，否則會切出單字碎片
+_MIN_SPLIT_CHARS = 6
+
+# 二次切分候選點的邊界比例：只在中間 70% 找停頓，保證遞迴收斂且不切出碎片
+_SPLIT_MARGIN_RATIO = 0.15
+
+# 二次切分遞迴深度上限（防禦性；正常內容遠早於此就停）
+_MAX_SPLIT_DEPTH = 8
+
+# 判定「來源完全無標點」而發出 warning 的最短字數
+_NO_PUNC_WARN_CHARS = 30
+
+_EPS = 1e-6
+
+# 所有分句標點（強 + 弱），供強制切分找切點用
+_ALL_PUNC = _STRONG_PUNC | _WEAK_PUNC
+_ALL_PUNC_STR = "".join(_ALL_PUNC)
+
 # 用於清洗 token 的標點（對齊用）
 _STRIP_CHARS = "，。？！,.?!、；;：:—…「」『』（）《》【】\u3000 "
 
@@ -60,6 +89,73 @@ class Word:
 
 # ─── 智慧分行 ──────────────────────────────────────────────
 
+def has_sentence_punctuation(text: str) -> bool:
+    """文字中是否含任何分句標點（判斷 ASR 是否輸出標點）。"""
+    return any(c in _ALL_PUNC for c in text)
+
+
+def _find_cut_point(line: str, limit: int) -> int:
+    """
+    在過長的行中找強制切分位置，回傳 line[:cut] 的長度。
+
+    優先順序：行內標點 > 空白（英文單字邊界）> 單字起點 > 硬切。
+    切點不會早於 limit 的一半，避免切出碎行。
+    """
+    min_cut = max(1, int(limit * _MIN_CUT_RATIO))
+
+    # 1. 行內標點：切在標點之後，語意最自然
+    for i in range(limit - 1, min_cut - 2, -1):
+        if line[i] in _ALL_PUNC:
+            return i + 1
+
+    # 2. 空白：英文以此為單字邊界（切點的空白由呼叫方 lstrip 掉）
+    for i in range(limit, min_cut - 1, -1):
+        if line[i].isspace():
+            return i
+
+    # 3. 剛好落在英文單字中間 → 退回該單字起點
+    if line[limit - 1].isalnum() and line[limit].isalnum():
+        for i in range(limit - 1, min_cut - 1, -1):
+            if not line[i - 1].isalnum():
+                return i
+
+    # 4. 純中文無標點：硬切
+    return limit
+
+
+def _force_split_line(line: str, limit: int = _MAX_LINE_CHARS) -> List[str]:
+    """
+    無標點保底：把超過 limit 字的行強制切成多行。
+
+    ASR 若 use_itn=False（如 sensevoice-yue-int8）輸出完全沒有標點，
+    僅靠標點切分會讓整份 SRT 只剩一條字幕，故此處按字數兜底。
+
+    Args:
+        line: 已按標點切好、但可能仍過長的單行
+        limit: 單行字數上限
+
+    Returns:
+        切分後的行列表（長度總和不遺失文字）
+    """
+    if len(line) <= limit:
+        return [line] if line else []
+
+    pieces: List[str] = []
+    rest = line
+    while len(rest) > limit:
+        cut = _find_cut_point(rest, limit)
+        head = rest[:cut].rstrip(_ALL_PUNC_STR).strip()
+        if head:
+            pieces.append(head)
+        rest = rest[cut:].lstrip()
+
+    tail = rest.rstrip(_ALL_PUNC_STR).strip()
+    if tail:
+        pieces.append(tail)
+
+    return pieces
+
+
 def smart_split(text: str) -> List[str]:
     """
     按標點符號將文字智慧分成多行。
@@ -68,6 +164,7 @@ def smart_split(text: str) -> List[str]:
     - 強標點（。？！.?!）：總是換行
     - 弱標點（，,）：累積超過閾值才換行
     - 去除每行末尾標點
+    - 保底：切完仍超過 `_MAX_LINE_CHARS` 字的行按字數強制切分
 
     Args:
         text: 合併後的識別文字
@@ -115,7 +212,12 @@ def smart_split(text: str) -> List[str]:
     if remainder:
         lines.append(remainder)
 
-    return lines
+    # 保底：無標點來源靠標點切不開，按字數強制切分
+    split_lines: List[str] = []
+    for line in lines:
+        split_lines.extend(_force_split_line(line))
+
+    return split_lines
 
 
 # ─── Token → Word 轉換 ────────────────────────────────────
@@ -252,7 +354,87 @@ def align_lines_to_words(
         result.append((start, end, line))
         char_offset += line_clean_len
 
-    return result
+    return _split_long_cues(result, words)
+
+
+def _word_span(words: List[Word], start: float, end: float) -> List[Word]:
+    """取落在 [start, end] 區間內的 Word（含邊界容差）。"""
+    return [
+        w for w in words
+        if w.start >= start - _EPS and w.end <= end + _EPS
+    ]
+
+
+def _split_long_cues(
+    timed_lines: List[Tuple[float, float, str]],
+    words: List[Word],
+    depth: int = 0,
+) -> List[Tuple[float, float, str]]:
+    """
+    對時長超過上限的字幕條做二次切分，切點落在 words 之間最大的停頓上。
+
+    無標點的 ASR 輸出即使按字數切好行，對齊後仍可能出現橫跨十幾秒的字幕；
+    依相鄰 Word 的 end→start 間隔找最大缺口，切點自然落在說話者的停頓處。
+
+    Args:
+        depth: 遞迴深度（防禦性上限，正常內容遠早於此就收斂）
+    """
+    if depth >= _MAX_SPLIT_DEPTH or not words:
+        return timed_lines
+
+    out: List[Tuple[float, float, str]] = []
+    changed = False
+
+    for start, end, text in timed_lines:
+        if end - start <= _MAX_SUBTITLE_DURATION or len(text) < _MIN_SPLIT_CHARS:
+            out.append((start, end, text))
+            continue
+
+        span = _word_span(words, start, end)
+        cut = _find_pause_cut(span) if len(span) >= 2 else None
+
+        if cut is None:
+            # 找不到停頓（或無 word 資訊）→ 按字數中分，時間按比例切
+            mid = len(text) // 2
+            split_time = start + (end - start) * (mid / len(text))
+        else:
+            cut_index, split_time = cut
+            # 文字按 word 比例切，避免時間切了文字沒切
+            mid = max(1, min(len(text) - 1, round(len(text) * cut_index / len(span))))
+
+        head, tail = text[:mid].strip(), text[mid:].strip()
+        if not head or not tail:
+            # 切點落在空白帶，會產出只有空白的字幕條 → 不如不切
+            out.append((start, end, text))
+            continue
+
+        out.append((start, split_time, head))
+        out.append((split_time, end, tail))
+        changed = True
+
+    return _split_long_cues(out, words, depth + 1) if changed else out
+
+
+def _find_pause_cut(span: List[Word]) -> Optional[Tuple[int, float]]:
+    """
+    在 Word 序列中找最大停頓，回傳 (切點 word 索引, 切分時間)。
+
+    只在中間區段找切點，保證兩側都有內容、遞迴能收斂。
+    """
+    margin = max(1, int(len(span) * _SPLIT_MARGIN_RATIO))
+    lo, hi = margin, len(span) - margin
+    if hi <= lo:
+        return None
+
+    best_index = lo
+    best_gap = -1.0
+    for i in range(lo, hi):
+        gap = span[i].start - span[i - 1].end
+        if gap > best_gap:
+            best_gap = gap
+            best_index = i
+
+    return best_index, span[best_index].start
 
 
 # ─── SRT 格式化 ────────────────────────────────────────────
@@ -369,6 +551,13 @@ class OutputWriter:
             path: 輸出路徑
         """
         path = Path(path)
+        full = self.full_text
+        # 無標點模型（如 sensevoice-yue use_itn=False）靠標點切不出字幕，
+        # 已按字數與停頓強制分行，但要讓用戶知道分行點不是語意邊界
+        if len(full) >= _NO_PUNC_WARN_CHARS and not has_sentence_punctuation(full):
+            logger.warning(
+                "此模型未輸出標點，字幕已按字數與停頓強制分行: %s", path.name,
+            )
         content = generate_srt_content(self.timed_lines)
         path.write_text(content, encoding="utf-8")
         logger.info("SRT 已保存: %s (%d 條字幕)", path.name, len(self.timed_lines))

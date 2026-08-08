@@ -27,6 +27,27 @@ logger = get_logger("clipboard")
 CF_UNICODETEXT = 13
 GMEM_MOVEABLE = 0x0002
 
+# 一旦清空就無法復原嘅非文字格式（圖片／複製嘅檔案／音訊／中繼檔）。
+# capture_selection() 走後備路徑時見到任何一個，就寧可放棄擷取都唔清空剪貼板。
+CF_TEXT, CF_BITMAP, CF_METAFILEPICT, CF_OEMTEXT = 1, 2, 3, 7
+CF_TIFF, CF_DIB = 6, 8
+CF_PALETTE, CF_RIFF, CF_WAVE, CF_ENHMETAFILE, CF_HDROP, CF_DIBV5 = 9, 11, 12, 14, 15, 17
+CF_LOCALE = 16
+
+# 白名單而非黑名單：實務上不可復原的內容常用 >= 0xC000 的註冊格式
+#（"PNG"、"FileGroupDescriptorW"+"FileContents"、"Preferred DropEffect"），
+# 黑名單一定漏。只有確定是純文字的格式才算「清空無損失」。
+_TEXT_FORMATS = frozenset({CF_TEXT, CF_OEMTEXT, CF_UNICODETEXT, CF_LOCALE})
+
+# 密碼管理員／瀏覽器用這些註冊格式標記「此內容勿讀取、勿進剪貼簿歷史」。
+# 見到任何一個就放棄擷取——絕不能把別人的密碼送去雲端 LLM。
+_SENSITIVE_FORMAT_NAMES = (
+    "Clipboard Viewer Ignore",
+    "ExcludeClipboardContentFromMonitorProcessing",
+    "CanIncludeInClipboardHistory",
+    "CanUploadToCloudClipboard",
+)
+
 # 貼上後等幾耐先還原剪貼板（僅 restore=True 時）。
 # 由 0.15s 提升到 0.4s：俾慢應用（Electron/瀏覽器/遠端桌面）足夠時間讀取，
 # 避免未貼完就被還原成舊內容。
@@ -54,6 +75,27 @@ _SetClipboardData = _user32.SetClipboardData
 _SetClipboardData.argtypes = [wt.UINT, wt.HANDLE]
 _SetClipboardData.restype = wt.HANDLE
 
+_EnumClipboardFormats = _user32.EnumClipboardFormats
+_EnumClipboardFormats.argtypes = [wt.UINT]
+_EnumClipboardFormats.restype = wt.UINT
+
+# 剪貼板內容每次變更都會遞增嘅全局序號；用嚟非破壞性偵測 Ctrl+C 有冇生效。
+_GetClipboardSequenceNumber = getattr(_user32, "GetClipboardSequenceNumber", None)
+if _GetClipboardSequenceNumber is not None:
+    _GetClipboardSequenceNumber.argtypes = []
+    _GetClipboardSequenceNumber.restype = wt.DWORD
+
+_RegisterClipboardFormatW = _user32.RegisterClipboardFormatW
+_RegisterClipboardFormatW.argtypes = [wt.LPCWSTR]
+_RegisterClipboardFormatW.restype = wt.UINT
+
+_GetForegroundWindow = _user32.GetForegroundWindow
+_GetForegroundWindow.argtypes = []
+_GetForegroundWindow.restype = wt.HWND
+
+# _sensitive_format_ids() 的快取（延遲註冊，避免 import 期做 Win32 呼叫）
+_SENSITIVE_FORMAT_IDS: Optional[frozenset] = None
+
 # Memory
 _GlobalAlloc = _kernel32.GlobalAlloc
 _GlobalAlloc.argtypes = [wt.UINT, ctypes.c_size_t]
@@ -66,6 +108,10 @@ _GlobalLock.restype = ctypes.c_void_p
 _GlobalUnlock = _kernel32.GlobalUnlock
 _GlobalUnlock.argtypes = [wt.HANDLE]
 _GlobalUnlock.restype = wt.BOOL
+
+_GlobalFree = _kernel32.GlobalFree
+_GlobalFree.argtypes = [wt.HANDLE]
+_GlobalFree.restype = wt.HANDLE
 
 
 # ─── 低階剪貼板操作 ──────────────────────────────────────
@@ -99,6 +145,96 @@ def _read_text() -> Optional[str]:
         _GlobalUnlock(handle)
 
 
+def _clipboard_sequence() -> Optional[int]:
+    """
+    讀取剪貼板序號（內容每次變更都遞增），用嚟非破壞性偵測剪貼板有冇被改動。
+
+    Returns:
+        序號；API 不存在、呼叫失敗或無 WINSTA_ACCESSCLIPBOARD 權限（回 0）時為 None
+    """
+    if _GetClipboardSequenceNumber is None:
+        return None
+    try:
+        seq = int(_GetClipboardSequenceNumber())
+    except OSError as err:
+        logger.warning("讀取剪貼板序號失敗: %s", err)
+        return None
+    return seq if seq else None  # 0 = 冇存取權限，當作取唔到
+
+
+def _sensitive_format_ids() -> frozenset[int]:
+    """密碼管理員用嚟標記「勿讀取」嘅註冊格式 ID（延遲註冊 + 快取）。"""
+    global _SENSITIVE_FORMAT_IDS
+    if _SENSITIVE_FORMAT_IDS is None:
+        ids = set()
+        for name in _SENSITIVE_FORMAT_NAMES:
+            try:
+                fmt = int(_RegisterClipboardFormatW(name))
+            except OSError as err:
+                logger.warning("註冊剪貼板格式 %s 失敗: %s", name, err)
+                continue
+            if fmt:
+                ids.add(fmt)
+        _SENSITIVE_FORMAT_IDS = frozenset(ids)
+    return _SENSITIVE_FORMAT_IDS
+
+
+def _enum_formats() -> Optional[frozenset[int]]:
+    """
+    列舉剪貼板現有格式。
+
+    Returns:
+        格式 ID 集合；開唔到剪貼板或列舉中途失敗（無法判斷）時回 None。
+        注意 EnumClipboardFormats 回 0 同時代表「列舉完畢」同「失敗」，
+        必須用 GetLastError() 分辨——當成「完畢」會 fail-open 毀掉圖片。
+    """
+    if not _open_clipboard():
+        return None
+    try:
+        formats: set[int] = set()
+        ctypes.set_last_error(0)
+        fmt = _EnumClipboardFormats(0)
+        while fmt:
+            formats.add(int(fmt))
+            ctypes.set_last_error(0)
+            fmt = _EnumClipboardFormats(fmt)
+        if ctypes.get_last_error() != 0:
+            logger.warning("列舉剪貼板格式中途失敗: %d", ctypes.get_last_error())
+            return None
+        return frozenset(formats)
+    finally:
+        _CloseClipboard()
+
+
+def _has_non_text_formats() -> Optional[bool]:
+    """
+    檢查剪貼板是否存在清空後無法復原嘅非文字內容（圖片／複製嘅檔案等）。
+
+    用白名單判斷：只要有任何一個唔喺文字白名單內嘅格式就當非文字。
+    黑名單一定漏掉 "PNG"、"FileGroupDescriptorW" 呢類註冊格式。
+
+    Returns:
+        True/False；無法判斷時回 None，呼叫端應保守處理
+    """
+    formats = _enum_formats()
+    if formats is None:
+        return None
+    return any(fmt not in _TEXT_FORMATS for fmt in formats)
+
+
+def _is_sensitive_clipboard() -> Optional[bool]:
+    """
+    剪貼板有冇被標記為敏感（密碼管理員／勿進剪貼簿歷史）。
+
+    Returns:
+        True/False；無法判斷時回 None，呼叫端應保守處理（當成敏感）
+    """
+    formats = _enum_formats()
+    if formats is None:
+        return None
+    return bool(formats & _sensitive_format_ids())
+
+
 def _write_text(text: str) -> bool:
     """將 Unicode 文字寫入剪貼板（需先 OpenClipboard + EmptyClipboard）。"""
     # UTF-16LE 編碼 + null 終止符
@@ -109,8 +245,11 @@ def _write_text(text: str) -> bool:
     if not handle:
         return False
 
+    # GMEM_MOVEABLE 區塊的所有權只在 SetClipboardData 成功後才移交系統，
+    # 所以每條失敗路徑都必須自己 GlobalFree，否則常駐程式會慢慢漏記憶體。
     ptr = _GlobalLock(handle)
     if not ptr:
+        _GlobalFree(handle)
         return False
 
     try:
@@ -118,8 +257,10 @@ def _write_text(text: str) -> bool:
     finally:
         _GlobalUnlock(handle)
 
-    result = _SetClipboardData(CF_UNICODETEXT, handle)
-    return bool(result)
+    if not _SetClipboardData(CF_UNICODETEXT, handle):
+        _GlobalFree(handle)
+        return False
+    return True
 
 
 # ─── 公開 API ─────────────────────────────────────────────
@@ -223,6 +364,95 @@ class ClipboardManager:
         except Exception as err:  # noqa: BLE001 — 任何失敗都回報，避免被外層靜默吞掉
             logger.error("粘貼流程異常: %s", err, exc_info=True)
             return False
+
+    @classmethod
+    def capture_selection(
+        cls, timeout: float = 0.5, poll_interval: float = 0.03,
+    ) -> Optional[str]:
+        """
+        模擬 Ctrl+C 讀取當前選取文字（非破壞性）。
+
+        主流程（序號法）：備份原文字 → 記下剪貼板序號 → 模擬 Ctrl+C → 輪詢至序號
+        改變先讀取 → 還原原文字。全程唔清空剪貼板，所以原本嘅圖片／複製嘅檔案
+        唔會被毀（Bug R15）。
+
+        後備流程（序號 API 取唔到時）：先用 EnumClipboardFormats 檢查有冇非文字
+        格式，有（或無法判斷）就直接放棄擷取回傳 None；確認純文字先沿用舊嘅
+        「清空 → Ctrl+C → 輪詢」做法。
+
+        Args:
+            timeout: 最長等待秒數
+            poll_interval: 輪詢間隔秒數
+
+        Returns:
+            選取的文字；偵測不到選取（含僅空白、Ctrl+C 模擬失敗、逾時、為保護
+            非文字剪貼板而放棄）時回傳 None
+        """
+        from utils.keyboard import KeyboardSimulator
+
+        # 敏感內容（密碼管理員標記）一律唔掂——序號變更只證明剪貼板被改過，
+        # 唔證明係我哋嘅 Ctrl+C 改嘅；讀錯咗會把別人嘅密碼送去雲端 LLM。
+        if _is_sensitive_clipboard() is not False:
+            logger.warning("剪貼板已標記為敏感內容（或無法判斷），放棄擷取選取文字")
+            return None
+
+        # 記下焦點視窗：Ctrl+C 送去邊個視窗、之後讀返嚟嘅內容應該同源。
+        # 期間焦點被搶走代表寫入者好可能係其他應用。
+        try:
+            before_hwnd = _GetForegroundWindow()
+        except OSError:
+            before_hwnd = None
+
+        original = cls.get_text()
+        before_seq = _clipboard_sequence()
+        dirtied = False  # 剪貼板有冇被我哋改動過，決定收尾使唔使還原
+
+        if before_seq is None:
+            # 後備路徑：冇序號可用，只能靠清空辨識新內容——但唔可以毀掉非文字內容
+            if _has_non_text_formats() is not False:  # True 或 None（判斷唔到）都放棄
+                logger.warning("剪貼板含非文字內容（或無法判斷），放棄擷取選取文字以免毀掉")
+                return None
+            cls.clear()
+            dirtied = True
+
+        selected: Optional[str] = None
+        if KeyboardSimulator.press_ctrl_c():
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                time.sleep(poll_interval)
+                if before_seq is not None:
+                    current = _clipboard_sequence()
+                    if current is None or current == before_seq:
+                        continue  # 序號未變＝Ctrl+C 未生效，唔好讀（否則會誤判舊內容）
+                    dirtied = True
+                # 寫入者可能係其他應用（密碼管理員、瀏覽器擴充）——內容變咗
+                # 但焦點視窗換咗，或者新內容被標記敏感，一律唔讀。
+                if _is_sensitive_clipboard() is not False:
+                    logger.warning("擷取期間剪貼板出現敏感標記，放棄讀取")
+                    break
+                if before_hwnd is not None:
+                    try:
+                        if _GetForegroundWindow() != before_hwnd:
+                            logger.warning("擷取期間焦點視窗已變更，放棄讀取以免讀到其他應用的內容")
+                            break
+                    except OSError:
+                        pass
+                text = cls.get_text()
+                if text and text.strip():
+                    selected = text
+                    break
+
+        if dirtied:  # 冇改動過就唔好郁，避免無謂寫入
+            if original is not None:
+                cls.set_text(original)
+            else:
+                cls.clear()
+
+        if selected:
+            logger.debug("已讀取選取文字: %d 個字元", len(selected))
+        else:
+            logger.debug("未偵測到選取文字")
+        return selected
 
     @classmethod
     def clear(cls) -> None:

@@ -88,6 +88,8 @@ class LLMResult:
         token_count:  估算的 token 數（基於 chunk 計數）
         elapsed_time: 處理耗時（秒）
         was_stopped:  是否被用戶中途停止
+        truncated:    回覆是否因 max_tokens 上限被截斷（finish_reason == "length"）
+        finish_reason: API 回報的結束原因
     """
 
     text: str = ""
@@ -96,6 +98,8 @@ class LLMResult:
     was_stopped: bool = False
     error: str = ""
     warnings: list[str] = field(default_factory=list)
+    truncated: bool = False
+    finish_reason: str = ""
 
 
 # ─── 常數 ──────────────────────────────────────────────────
@@ -106,6 +110,31 @@ _HOTWORD_INJECT_TEMPLATE: str = (
 )
 
 _MAX_HISTORY_TURNS: int = 10
+
+# 潤色輸出長度與輸入相當，max_tokens 不足時回覆會被硬切成半截。
+# 中文約 1 字 ≈ 1.5 token，抓 2 倍再加緩衝；上限避免超出模型可接受範圍。
+# 降級鏈的總時間預算（秒）：呼叫端沒給截止時間時的保底上限
+_FAILOVER_BUDGET: float = 15.0
+
+_MAX_TOKENS_PER_CHAR: int = 2
+_MAX_TOKENS_CEILING: int = 32768
+
+
+def compute_max_tokens(configured: int, text: str) -> int:
+    """
+    依輸入長度抬高 max_tokens 下限，避免長逐字稿的潤色結果被截斷。
+
+    只會往上調，永不低於使用者設定值。
+
+    Args:
+        configured: 使用者設定的 max_tokens
+        text:       本次要送給模型的文字
+
+    Returns:
+        實際要用的 max_tokens
+    """
+    needed = len(text) * _MAX_TOKENS_PER_CHAR + 256
+    return max(configured, min(needed, _MAX_TOKENS_CEILING))
 
 # A1：auth/quota/網路類錯誤 → 值得切後備 provider 重試
 _FAILOVER_ERROR_MARKERS: tuple[str, ...] = (
@@ -205,10 +234,19 @@ class LLMProcessor:
                 return LLMResult(text=text, elapsed_time=0.0, error=reason)
             client_snapshot = self._client
             provider_snapshot = self._provider
+            configured_tokens = getattr(self._llm_config, "max_tokens", 1024)
+            if not isinstance(configured_tokens, int):
+                configured_tokens = 1024
+            # 長逐字稿的潤色輸出與輸入等長，設定值不夠會被硬切成半截
+            needed_tokens = compute_max_tokens(configured_tokens, text)
             # 逾時保護：用帶 timeout 的臨時 client，避免 stall 卡到預設 30s
-            if request_timeout is not None and provider_snapshot is not None:
+            if provider_snapshot is not None and (
+                request_timeout is not None or needed_tokens > configured_tokens
+            ):
                 client_snapshot = self._build_client(
-                    provider_snapshot, timeout=request_timeout,
+                    provider_snapshot,
+                    timeout=request_timeout,
+                    max_tokens=needed_tokens,
                 )
             history_snapshot = (
                 list(self._conversation_history) if role.enable_history else []
@@ -251,6 +289,7 @@ class LLMProcessor:
                 on_token=on_token,
                 should_stop=should_stop,
                 request_timeout=request_timeout,
+                max_tokens=needed_tokens,
             )
 
         result.elapsed_time = time.monotonic() - start_time
@@ -323,17 +362,24 @@ class LLMProcessor:
         self._client = self._build_client(self._provider)
 
     def _build_client(
-        self, provider: ProviderInfo, timeout: float | None = None,
+        self,
+        provider: ProviderInfo,
+        timeout: float | None = None,
+        max_tokens: int | None = None,
     ) -> LLMClient:
         """用當前 LLM 參數為指定 provider 建立 client（init 與降級共用）。
 
         timeout 非 None 時覆蓋預設 read timeout（語音潤色逾時保護用），
         確保連線 stall 時單一請求不會卡到預設 30s。
+
+        max_tokens 非 None 時覆蓋設定值（長逐字稿防截斷用）。
         """
         kwargs: dict[str, Any] = {
             "provider": provider,
             "temperature": getattr(self._llm_config, "temperature", 0.3),
-            "max_tokens": getattr(self._llm_config, "max_tokens", 1024),
+            "max_tokens": max_tokens
+            if max_tokens is not None
+            else getattr(self._llm_config, "max_tokens", 1024),
             "top_p": getattr(self._llm_config, "top_p", 1.0),
             "frequency_penalty": getattr(self._llm_config, "frequency_penalty", 0.0),
             "presence_penalty": getattr(self._llm_config, "presence_penalty", 0.0),
@@ -356,6 +402,7 @@ class LLMProcessor:
         on_token: Callable[[str], None] | None,
         should_stop: Callable[[], bool] | None,
         request_timeout: float | None = None,
+        max_tokens: int | None = None,
     ) -> LLMResult:
         """
         當前 provider auth/quota/網路失敗 → 依序試其他可用 provider。
@@ -373,9 +420,16 @@ class LLMProcessor:
         failed_key = failed_provider.key if failed_provider else None
         last = LLMResult(text="", error=first_error)
 
+        # 自算截止時間：repolish / 檔案轉錄不傳 should_stop，沒有它降級會
+        # 無上限逐一試完所有填了 key 的 provider，最壞 30–120 秒（R7）
+        deadline = time.monotonic() + max(request_timeout or _FAILOVER_BUDGET, _FAILOVER_BUDGET)
+
         for prov in list_available_providers(self._config):
             if should_stop is not None and should_stop():
                 logger.info("LLM 降級中止：已達潤色截止時間")
+                break
+            if time.monotonic() >= deadline:
+                logger.info("LLM 降級中止：已達降級總預算")
                 break
             if prov.key == failed_key or prov.key in self._failed_providers:
                 continue
@@ -383,7 +437,9 @@ class LLMProcessor:
                 "LLM 降級：改試後備 provider %s (%s)", prov.key, prov.name
             )
             result = self._stream_chat(
-                client=self._build_client(prov, timeout=request_timeout),
+                client=self._build_client(
+                    prov, timeout=request_timeout, max_tokens=max_tokens,
+                ),
                 messages=messages,
                 on_token=on_token,
                 should_stop=should_stop,
@@ -482,9 +538,10 @@ class LLMProcessor:
 
         # iter 3 Bug C：用 per-call API 取 warnings，避免多 thread 共用 client
         # 時 instance 上的 _param_warnings 被其他 thread 覆蓋造成 UX 洩漏。
+        meta: dict[str, Any] = {}
         try:
             stream, call_warnings = active_client.chat_with_warnings(
-                messages, stream=True,
+                messages, stream=True, meta=meta,
             )
             for chunk in stream:
                 # 檢查停止條件
@@ -516,6 +573,16 @@ class LLMProcessor:
         result.text = "".join(chunks)
         # warnings 直接從 per-call list 取得（此 list 為本 call 專用，無共享）
         result.warnings = list(call_warnings)
+        result.finish_reason = meta.get("finish_reason", "")
+        # finish_reason == "length" 代表撞到 max_tokens，回覆是半截的。
+        # 中途停止本來就是不完整，不重複標記為截斷。
+        result.truncated = result.finish_reason == "length" and not result.was_stopped
+
+        if result.truncated:
+            logger.warning(
+                "LLM 回覆被 max_tokens 截斷（已產出 %d 字），將降級回原文",
+                len(result.text),
+            )
 
         return result
 
