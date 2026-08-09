@@ -419,6 +419,42 @@ class MainWindow(QMainWindow):
         self._stack.setCurrentIndex(_PAGE_VOICE)
         logger.debug("切換到語音頁")
 
+    def _ask_unsaved_settings(self) -> str:
+        """問用戶未儲存的設定要怎麼處理，回傳 save / discard / cancel。"""
+        box = QMessageBox(self)
+        box.setWindowTitle("尚未儲存")
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setText("設定有未儲存的變更。")
+        box.setInformativeText("離開會回復成上次儲存的內容。")
+        save_btn = box.addButton("儲存並離開", QMessageBox.ButtonRole.AcceptRole)
+        discard_btn = box.addButton("放棄修改", QMessageBox.ButtonRole.DestructiveRole)
+        box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(save_btn)
+        box.exec()
+
+        clicked = box.clickedButton()
+        if clicked is save_btn:
+            return "save"
+        if clicked is discard_btn:
+            return "discard"
+        return "cancel"
+
+    @Slot()
+    def _on_settings_back(self) -> None:
+        """設定頁「返回（不儲存）」：有未儲存變更時先問（U10）。"""
+        panel = self._settings_panel
+        if panel is None or not panel.is_dirty():
+            self._navigate_to_voice()
+            return
+
+        choice = self._ask_unsaved_settings()
+        if choice == "save":
+            self._on_settings_save()
+        elif choice == "discard":
+            logger.info("使用者放棄未儲存的設定變更")
+            self._navigate_to_voice()
+        # cancel：留在設定頁，什麼都不做
+
     @Slot()
     def _on_settings_save(self) -> None:
         """設定頁「儲存」按鈕：讀取 config，發出信號，返回語音頁。"""
@@ -600,8 +636,10 @@ class MainWindow(QMainWindow):
         # ── 頂部列：返回按鈕 + 標題 ──────────────
         top_bar = QHBoxLayout()
 
-        back_btn = QPushButton("← 返回")
-        back_btn.setFixedWidth(80)
+        # 文案講清楚它不會儲存：舊的「← 返回」看起來像瀏覽器返回，
+        # 很多人以為等同「完成」，按下去五分鐘的設定就沒了（U10）
+        back_btn = QPushButton("← 返回（不儲存）")
+        back_btn.setFixedWidth(130)
         back_btn.setStyleSheet(
             "QPushButton {"
             "  font-size: 13px;"
@@ -615,7 +653,7 @@ class MainWindow(QMainWindow):
             "QPushButton:pressed { background-color: #90CAF9; }"
             "QPushButton:focus { outline: none; background-color: #BBDEFB; }"
         )
-        back_btn.clicked.connect(self._navigate_to_voice)
+        back_btn.clicked.connect(self._on_settings_back)
 
         settings_title = QLabel("設置")
         settings_title.setStyleSheet(

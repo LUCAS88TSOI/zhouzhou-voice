@@ -141,6 +141,8 @@ def _make_processor():
         active_provider = ""
         providers: dict = {}
         enabled = True
+        # U14：降級預設關閉，這組測試針對降級迴圈本身，故明示開啟
+        allow_provider_failover = True
 
     class _Cfg:
         llm = _LLM()

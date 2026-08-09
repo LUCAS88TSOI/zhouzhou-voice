@@ -42,6 +42,37 @@ class RecordingRecord:
     model_key: str = ""
 
 
+@dataclass(frozen=True)
+class RecordingMeta:
+    """錄音記錄的中繼資料（不含 audio_data）。
+
+    列表只需要這些欄位；刻意不放 audio_data，避免為了畫一列表格
+    把整段 WAV 撈進記憶體（歷史列表一次 100 筆）。
+    """
+    id: int
+    timestamp: datetime
+    duration: float
+    asr_text: str = ""
+    llm_text: str = ""
+    role_id: str = ""
+    model_key: str = ""
+
+    @property
+    def display_text(self) -> str:
+        """列表要顯示的文字：優先用貼出去的那一版。"""
+        return self.llm_text or self.asr_text
+
+
+_META_COLUMNS = "id, timestamp, duration, asr_text, llm_text, role_id, model_key"
+
+
+def _like_escape(keyword: str) -> str:
+    """跳脫 LIKE 的萬用字元，讓 % 與 _ 當字面值處理。"""
+    for ch in ("\\", "%", "_"):
+        keyword = keyword.replace(ch, f"\\{ch}")
+    return keyword
+
+
 class RecordingDatabase:
     """錄音歷史資料庫"""
 
@@ -50,6 +81,7 @@ class RecordingDatabase:
     def __init__(self) -> None:
         self._conn: Optional[sqlite3.Connection] = None
         self._lock = threading.Lock()
+        self._count_cache: Optional[int] = None
         self._ensure_db()
 
     def _ensure_db(self) -> None:
@@ -108,6 +140,7 @@ class RecordingDatabase:
             )
             self._conn.commit()
             record_id = cursor.lastrowid
+            self._count_cache = None
         logger.debug("已儲存錄音記錄: id=%d, duration=%.2fs", record_id, duration)
         return record_id
 
@@ -120,13 +153,44 @@ class RecordingDatabase:
         return self._row_to_record(row) if row else None
 
     def get_recent(self, limit: int = 50) -> List[RecordingRecord]:
-        """取得最近的記錄"""
+        """取得最近的記錄（含 audio_data，只在真的需要音訊時用）"""
         with self._lock:
             rows = self._conn.execute(
                 "SELECT * FROM recordings ORDER BY timestamp DESC LIMIT ?",
                 (limit,),
             ).fetchall()
         return [self._row_to_record(r) for r in rows]
+
+    def get_recent_meta(
+        self,
+        limit: int = 100,
+        offset: int = 0,
+        keyword: str = "",
+    ) -> List[RecordingMeta]:
+        """取得最近的記錄中繼資料（不含 audio_data）。
+
+        keyword 對 asr_text 與 llm_text 做 LIKE，limit/offset/keyword
+        全部下推到 SQL —— 在 Python 端過濾等於先把整張表撈出來。
+        """
+        where, params = self._keyword_clause(keyword)
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT {_META_COLUMNS} FROM recordings{where}"
+                " ORDER BY timestamp DESC LIMIT ? OFFSET ?",
+                (*params, limit, offset),
+            ).fetchall()
+        return [self._row_to_meta(r) for r in rows]
+
+    @staticmethod
+    def _keyword_clause(keyword: str) -> tuple[str, tuple]:
+        """組出 WHERE 子句與參數；keyword 為空時回傳空子句。"""
+        if not keyword:
+            return "", ()
+        pattern = f"%{_like_escape(keyword)}%"
+        return (
+            " WHERE asr_text LIKE ? ESCAPE '\\' OR llm_text LIKE ? ESCAPE '\\'",
+            (pattern, pattern),
+        )
 
     def update(
         self,
@@ -169,6 +233,8 @@ class RecordingDatabase:
             )
             self._conn.commit()
             deleted = cursor.rowcount > 0
+            if deleted:
+                self._count_cache = None
         if deleted:
             logger.debug("已刪除錄音記錄: id=%d", record_id)
         return deleted
@@ -183,16 +249,27 @@ class RecordingDatabase:
             )
             self._conn.commit()
             deleted = cursor.rowcount
+            if deleted:
+                self._count_cache = None
         if deleted > 0:
             logger.info("已清理 %d 筆過期錄音記錄", deleted)
         return deleted
 
-    def count(self) -> int:
-        """取得總記錄數"""
-        with self._lock:
-            return self._conn.execute(
-                "SELECT COUNT(*) FROM recordings"
-            ).fetchone()[0]
+    def count(self, keyword: str = "") -> int:
+        """取得記錄數。無關鍵字的總數會快取（每次語音輸入都要用）。"""
+        if keyword:
+            where, params = self._keyword_clause(keyword)
+            with self._lock:
+                return self._conn.execute(
+                    f"SELECT COUNT(*) FROM recordings{where}", params,
+                ).fetchone()[0]
+
+        if self._count_cache is None:
+            with self._lock:
+                self._count_cache = self._conn.execute(
+                    "SELECT COUNT(*) FROM recordings"
+                ).fetchone()[0]
+        return self._count_cache
 
     @staticmethod
     def _encode_wav(audio_bytes: bytes, duration: float) -> bytes:
@@ -229,6 +306,19 @@ class RecordingDatabase:
             int16_samples = struct.unpack(f"{n_samples}h", frames)
             float_samples = [s / 32767.0 for s in int16_samples]
             return struct.pack(f"{n_samples}f", *float_samples)
+
+    @staticmethod
+    def _row_to_meta(row: sqlite3.Row) -> RecordingMeta:
+        """轉換資料庫行為 Meta 物件（不含音訊）"""
+        return RecordingMeta(
+            id=row["id"],
+            timestamp=datetime.fromisoformat(row["timestamp"]),
+            duration=row["duration"],
+            asr_text=row["asr_text"] or "",
+            llm_text=row["llm_text"] or "",
+            role_id=row["role_id"] or "",
+            model_key=row["model_key"] or "",
+        )
 
     @staticmethod
     def _row_to_record(row: sqlite3.Row) -> RecordingRecord:

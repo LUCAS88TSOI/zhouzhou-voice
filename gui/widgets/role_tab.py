@@ -65,6 +65,13 @@ class RoleTab(QWidget):
             builtin_overrides or {}
         )
 
+        # 未儲存變更偵測（U10）：角色提示詞動輒幾百字，切個角色作對照
+        # 就被 setPlainText 蓋掉，零提示。_loaded_* 是「編輯框剛載入時」的
+        # 快照，_loading 讓程式化重填（儲存後刷新清單）不觸發詢問。
+        self._loaded_role_id: str = ""
+        self._loaded_snapshot: tuple = ()
+        self._loading: bool = False
+
         self._build_ui()
         self._refresh_role_list()
 
@@ -136,6 +143,12 @@ class RoleTab(QWidget):
         self._hotword_check = QCheckBox("啟用熱詞校正")
         options_row.addWidget(self._history_check)
         options_row.addWidget(self._hotword_check)
+
+        # 任何編輯都即時更新「儲存修改 *」標記（U10）
+        self._name_input.textChanged.connect(lambda _: self._mark_dirty())
+        self._prompt_edit.textChanged.connect(self._mark_dirty)
+        self._history_check.toggled.connect(lambda _: self._mark_dirty())
+        self._hotword_check.toggled.connect(lambda _: self._mark_dirty())
         options_row.addStretch()
         detail_layout.addLayout(options_row)
 
@@ -214,6 +227,71 @@ class RoleTab(QWidget):
             self._role_combo.setCurrentIndex(0)
             self._on_role_selected(0)
 
+    # ─── 未儲存變更（U10） ────────────────────────────────
+
+    def _current_snapshot(self) -> tuple:
+        """編輯區當前值，用來跟載入時的快照比對。"""
+        return (
+            self._name_input.text(),
+            self._prompt_edit.toPlainText(),
+            self._history_check.isChecked(),
+            self._hotword_check.isChecked(),
+        )
+
+    def is_dirty(self) -> bool:
+        """編輯區是否有未儲存的變更。"""
+        if not self._loaded_role_id:
+            return False
+        return self._current_snapshot() != self._loaded_snapshot
+
+    def _mark_dirty(self) -> None:
+        """在「儲存修改」按鈕上標記未儲存狀態。"""
+        self._btn_save.setText(
+            "儲存修改 *" if self.is_dirty() else "儲存修改"
+        )
+
+    def _ask_unsaved_role(self) -> str:
+        """問用戶未儲存的角色編輯要怎麼處理，回傳 save / discard / cancel。"""
+        box = QMessageBox(self)
+        box.setWindowTitle("尚未儲存")
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setText(f"角色「{self._loaded_role_id}」有未儲存的修改。")
+        box.setInformativeText("切換角色會丟失這些修改。")
+        save_btn = box.addButton("儲存修改", QMessageBox.ButtonRole.AcceptRole)
+        discard_btn = box.addButton("放棄修改", QMessageBox.ButtonRole.DestructiveRole)
+        box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(save_btn)
+        box.exec()
+
+        clicked = box.clickedButton()
+        if clicked is save_btn:
+            return "save"
+        if clicked is discard_btn:
+            return "discard"
+        return "cancel"
+
+    def _index_of(self, role_id: str) -> int:
+        """在下拉選單中找出角色的位置；找不到回 -1。"""
+        for i in range(self._role_combo.count()):
+            if self._role_combo.itemData(i) == role_id:
+                return i
+        return -1
+
+    def _restore_combo_to_loaded(self) -> None:
+        """把下拉選單彈回目前編輯中的角色（用戶按了「取消」）。
+
+        用 blockSignals 而非 _loading：這裡絕不能重填編輯區，否則
+        「取消」反而把用戶正在寫的內容洗掉，比不問還糟。
+        """
+        index = self._index_of(self._loaded_role_id)
+        if index < 0:
+            return
+        blocked = self._role_combo.blockSignals(True)
+        try:
+            self._role_combo.setCurrentIndex(index)
+        finally:
+            self._role_combo.blockSignals(blocked)
+
     def _on_role_selected(self, index: int) -> None:
         """當用戶切換角色時，載入該角色的資訊到編輯區。"""
         if index < 0:
@@ -223,6 +301,36 @@ class RoleTab(QWidget):
         if role_id is None:
             return
 
+        # 切走前先問，別讓幾百字的提示詞靜默蒸發（U10）。
+        # _loading 期間是程式化重填（儲存後刷新清單），不可再問，否則遞歸。
+        if (
+            not self._loading
+            and self._loaded_role_id
+            and role_id != self._loaded_role_id
+            and self.is_dirty()
+        ):
+            choice = self._ask_unsaved_role()
+            if choice == "cancel":
+                self._restore_combo_to_loaded()
+                return
+            if choice == "save":
+                # 存回「正在編輯的那個角色」，不是下拉選單現在指的那個 ——
+                # 此刻 currentData() 已經是目標角色了，用它會把 A 的內容
+                # 寫進 B，而且 _select_role_by_id 會再觸發一次詢問 → 遞歸
+                self._save_editor_to(self._loaded_role_id)
+                self._loading = True
+                try:
+                    self._refresh_role_list()
+                    target = self._index_of(role_id)
+                    if target >= 0:
+                        self._role_combo.setCurrentIndex(target)
+                finally:
+                    self._loading = False
+
+        self._load_role_into_editor(role_id)
+
+    def _load_role_into_editor(self, role_id: str) -> None:
+        """把指定角色填進編輯區並重設髒標記。"""
         from llm.roles import BUILTIN_ROLES, get_all_roles
 
         is_builtin = role_id in BUILTIN_ROLES
@@ -270,6 +378,9 @@ class RoleTab(QWidget):
             self._builtin_hint_label.setVisible(False)
 
         self._active_role_id = role_id
+        self._loaded_role_id = role_id
+        self._loaded_snapshot = self._current_snapshot()
+        self._mark_dirty()
         self.role_changed.emit(role_id)
 
     # ─── 操作按鈕 ────────────────────────────────────────
@@ -354,34 +465,53 @@ class RoleTab(QWidget):
 
         logger.info("刪除自訂角色: %s", current_id)
 
-    def _on_save_edits(self) -> None:
-        """將編輯區的修改存回（內建 → overrides / 自訂 → custom_roles）。"""
+    def _save_editor_to(self, target_id: str) -> None:
+        """把編輯區內容寫回指定角色（內建 → overrides / 自訂 → custom_roles）。
+
+        target_id 必須明確傳入：切換角色途中選「儲存」時，下拉選單已經
+        指向新角色了，用 currentData() 會把舊角色的內容寫進新角色。
+        """
         from llm.roles import BUILTIN_ROLES
 
-        current_id = self._role_combo.currentData()
-        if current_id is None:
+        if not target_id:
             return
 
-        if current_id in BUILTIN_ROLES:
+        if target_id in BUILTIN_ROLES:
             # 內建角色：只存提示詞到 overrides
-            new_prompt = self._prompt_edit.toPlainText()
-            self._builtin_overrides[current_id] = new_prompt
-            logger.info("內建角色提示詞已修改: %s", current_id)
+            self._builtin_overrides[target_id] = self._prompt_edit.toPlainText()
+            logger.info("內建角色提示詞已修改: %s", target_id)
         else:
             # 自訂角色：存全部欄位
             for role in self._custom_roles:
-                if role.get("id") == current_id:
+                if role.get("id") == target_id:
                     role["name"] = (
-                        self._name_input.text().strip() or current_id
+                        self._name_input.text().strip() or target_id
                     )
                     role["system_prompt"] = self._prompt_edit.toPlainText()
                     role["enable_history"] = self._history_check.isChecked()
                     role["enable_hotwords"] = self._hotword_check.isChecked()
                     break
-            logger.info("自訂角色已儲存: %s", current_id)
+            logger.info("自訂角色已儲存: %s", target_id)
 
-        # 重新整理下拉選單（名稱/狀態可能變了）
-        self._refresh_role_list()
+        # 存過就不再是「未儲存」
+        self._loaded_snapshot = self._current_snapshot()
+        self._mark_dirty()
+
+    def _on_save_edits(self) -> None:
+        """「儲存修改」按鈕：存回當前編輯中的角色並刷新清單。"""
+        current_id = self._loaded_role_id or self._role_combo.currentData()
+        if not current_id:
+            return
+
+        self._save_editor_to(current_id)
+
+        # 重新整理下拉選單（名稱/狀態可能變了）。
+        # _loading 期間跳過髒檢查：這是程式化重填，再問一次會無限遞歸。
+        self._loading = True
+        try:
+            self._refresh_role_list()
+        finally:
+            self._loading = False
         self._select_role_by_id(current_id)
 
     def _on_restore_default(self) -> None:

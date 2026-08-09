@@ -48,11 +48,17 @@ class _DownloadRelay(QObject):
 class UpdateDialog(QDialog):
     """自動更新對話框：顯示版本資訊 + 下載進度 + 一鍵更新。"""
 
+    # 關閉時的使用者決定，由呼叫端讀取並寫回 config（U19）。
+    # 沒有這個記錄的話，「稍後提醒」等於什麼都沒做，明天開機再彈一次。
+    DECISION_SKIP = "skip"
+    DECISION_LATER = "later"
+
     def __init__(self, info: UpdateInfo, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._info = info
         self._cancel = threading.Event()
         self._downloading = False
+        self.decision: str = ""
 
         self.setWindowTitle("軟體更新")
         self.setFixedSize(460, 360)
@@ -114,8 +120,11 @@ class UpdateDialog(QDialog):
 
         # Buttons
         btn_row = QHBoxLayout()
-        self._btn_later = QPushButton("稍後提醒")
-        self._btn_later.clicked.connect(self.reject)
+        self._btn_skip = QPushButton("跳過此版本")
+        self._btn_skip.setToolTip("這個版本不再提示；有更新的版本時仍會通知")
+        self._btn_skip.clicked.connect(lambda: self._decide(self.DECISION_SKIP))
+        self._btn_later = QPushButton("稍後提醒（24 小時）")
+        self._btn_later.clicked.connect(lambda: self._decide(self.DECISION_LATER))
         self._btn_update = QPushButton("立即更新")
         self._btn_update.clicked.connect(self._on_update_clicked)
         self._btn_update.setStyleSheet(
@@ -123,12 +132,18 @@ class UpdateDialog(QDialog):
             "padding: 6px 20px; border-radius: 4px; font-weight: bold; }"
             "QPushButton:hover { background: #106ebe; }"
         )
+        btn_row.addWidget(self._btn_skip)
         btn_row.addWidget(self._btn_later)
         btn_row.addStretch()
         btn_row.addWidget(self._btn_update)
         lay.addLayout(btn_row)
 
     # ── Actions ──
+
+    def _decide(self, decision: str) -> None:
+        """記下使用者的選擇並關閉；呼叫端會把它寫回 config。"""
+        self.decision = decision
+        self.reject()
 
     def _on_update_clicked(self) -> None:
         if self._downloading:

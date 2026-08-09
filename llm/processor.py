@@ -68,12 +68,14 @@ class LLMResultStatus:
         text:         結果文本（可能與原文相同）
         was_processed: 是否實際送交 LLM 處理
         error:        錯誤訊息（若有）
+        not_configured: 是否純粹因為「還沒設定服務商」而沒處理（非失敗）
     """
 
     success: bool
     text: str
     was_processed: bool
     error: str = ""
+    not_configured: bool = False
 
 
 @dataclass
@@ -90,6 +92,8 @@ class LLMResult:
         was_stopped:  是否被用戶中途停止
         truncated:    回覆是否因 max_tokens 上限被截斷（finish_reason == "length"）
         finish_reason: API 回報的結束原因
+        not_configured: 是否因為根本沒有可用服務商而未處理（≠ 呼叫失敗）
+        used_provider: 實際回應這次請求的服務商 key（降級後會與設定值不同）
     """
 
     text: str = ""
@@ -100,6 +104,8 @@ class LLMResult:
     warnings: list[str] = field(default_factory=list)
     truncated: bool = False
     finish_reason: str = ""
+    not_configured: bool = False
+    used_provider: str = ""
 
 
 # ─── 常數 ──────────────────────────────────────────────────
@@ -231,7 +237,14 @@ class LLMProcessor:
             if not self._is_ready():
                 reason = "LLM 未就緒：無可用服務商（請在設定中配置 API Key）"
                 logger.warning(reason)
-                return LLMResult(text=text, elapsed_time=0.0, error=reason)
+                # 「從未配置」不是錯誤 —— 標記出來，讓 app 層改用一次性引導
+                # 提示，而不是每講一句話就彈一次「潤色失敗」（U1）
+                return LLMResult(
+                    text=text,
+                    elapsed_time=0.0,
+                    error=reason,
+                    not_configured=self._client is None,
+                )
             client_snapshot = self._client
             provider_snapshot = self._provider
             configured_tokens = getattr(self._llm_config, "max_tokens", 1024)
@@ -273,6 +286,8 @@ class LLMProcessor:
             on_token=on_token,
             should_stop=should_stop,
         )
+        if not result.used_provider and provider_snapshot is not None:
+            result.used_provider = provider_snapshot.key
 
         # A1：運行時自動降級 — auth/quota/網路類錯誤 → 試其他可用 provider。
         # 修復 provider.py 盲點：非空但失效的 key (is_available=True) 唔會喺
@@ -411,11 +426,20 @@ class LLMProcessor:
         - 暫時性失敗（429/網路）不入黑名單，下次仍會嘗試。
         - 截止時間已到（should_stop）→ 立即中止，不再試後備（杜絕 30s×N）。
         - 全部失敗時回傳最後一個 result（error 非空），由 process() fallback 原文。
+
+        跨服務商降級預設關閉：把同一份逐字稿改送別家，等於讓資料離開用戶
+        指定的收件方，必須先有明示同意（U14）。
         """
         if failed_provider is not None and self._matches(
             first_error, _PERMANENT_FAILURE_MARKERS
         ):
             self._failed_providers.add(failed_provider.key)
+
+        if not getattr(self._llm_config, "allow_provider_failover", False):
+            logger.warning(
+                "LLM 失敗且未開啟跨服務商降級，不改送其他服務商：%s", first_error,
+            )
+            return LLMResult(text="", error=first_error)
 
         failed_key = failed_provider.key if failed_provider else None
         last = LLMResult(text="", error=first_error)
@@ -446,6 +470,7 @@ class LLMProcessor:
             )
             if not result.error:
                 logger.info("LLM 降級成功：%s (%s)", prov.key, prov.name)
+                result.used_provider = prov.key
                 return result
             if self._matches(result.error, _PERMANENT_FAILURE_MARKERS):
                 self._failed_providers.add(prov.key)

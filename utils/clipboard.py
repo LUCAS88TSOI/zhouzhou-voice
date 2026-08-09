@@ -53,8 +53,12 @@ _SENSITIVE_FORMAT_NAMES = (
 # 避免未貼完就被還原成舊內容。
 _RESTORE_DELAY = 0.4
 
-_user32 = ctypes.windll.user32
-_kernel32 = ctypes.windll.kernel32
+# use_last_error=True 是必要的：ctypes.windll.X 建立的函式不會把 Win32
+# 的 LastError 存進 ctypes 的 thread-local，get_last_error() 會恆回 0 ——
+# 於是 _enum_formats() 那個「列舉中途失敗」的判斷永遠不成立，退回成
+# fail-open（把失敗當成「純文字」），正是 M2 要防的情況。
+_user32 = ctypes.WinDLL("user32", use_last_error=True)
+_kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
 # Clipboard
 _OpenClipboard = _user32.OpenClipboard
@@ -206,6 +210,15 @@ def _enum_formats() -> Optional[frozenset[int]]:
         _CloseClipboard()
 
 
+def foreground_window() -> int:
+    """取得當前前景視窗 handle；拿不到時回 0（代表「未知」）。"""
+    try:
+        return int(_GetForegroundWindow() or 0)
+    except Exception as err:  # noqa: BLE001 — 偵測失敗不得癱瘓貼上主功能
+        logger.warning("取得前景視窗失敗: %s", err)
+        return 0
+
+
 def _has_non_text_formats() -> Optional[bool]:
     """
     檢查剪貼板是否存在清空後無法復原嘅非文字內容（圖片／複製嘅檔案等）。
@@ -315,6 +328,7 @@ class ClipboardManager:
         cls,
         text: str,
         restore: bool = False,
+        expect_hwnd: int = 0,
     ) -> bool:
         """
         透過剪貼板粘貼文字到當前應用。
@@ -322,16 +336,20 @@ class ClipboardManager:
         流程：
         1. 備份原有剪貼板內容（若 restore=True）
         2. 寫入新文字到剪貼板
-        3. 模擬 Ctrl+V
-        4. 等待粘貼完成
+        3. 確認前景視窗仍是預期目標（若有給 expect_hwnd）
+        4. 模擬 Ctrl+V 並校驗注入結果
         5. 恢復原有剪貼板內容（若 restore=True）
 
         Args:
             text: 要粘貼的文字
             restore: 粘貼後是否恢復原始剪貼板內容（預設 False，結果留喺剪貼板）
+            expect_hwnd: 錄音當下記下的目標視窗 handle。0 = 不檢查。
+                開了 LLM 潤色時管線可耗 10-30 秒，期間用戶早就切走視窗，
+                盲貼會把逐字稿送進聊天室輸入框、密碼欄或程式碼中間（U9）。
 
         Returns:
-            是否成功貼上（寫入剪貼板或 Ctrl+V 失敗時回 False，且不冒泡異常）
+            是否成功貼上。視窗已切換或注入被擋時回 False，
+            但文字一定已在剪貼簿，呼叫端可以誠實地提示「手動 Ctrl+V」。
         """
         from utils.keyboard import KeyboardSimulator
 
@@ -346,7 +364,16 @@ class ClipboardManager:
                 logger.error("寫入剪貼板失敗，無法粘貼")
                 return False
 
-            # 3. 粘貼
+            # 3. 目標視窗校驗（handle 為 0 代表未知，一律放行）
+            current = foreground_window()
+            if expect_hwnd and current and current != expect_hwnd:
+                logger.warning(
+                    "目標視窗已切換（%s → %s），不貼上；文字留喺剪貼板",
+                    expect_hwnd, current,
+                )
+                return False
+
+            # 4. 粘貼
             time.sleep(0.02)
             if not KeyboardSimulator.press_ctrl_v():
                 logger.error("模擬 Ctrl+V 失敗，文字仍保留喺剪貼板")

@@ -142,6 +142,8 @@ def _make_failover_config(active_key="dead"):
     class _LLM:
         enabled = True
         active_provider = active_key
+        # U14：跨服務商降級預設關閉；本測試驗證的正是降級機制，故明示開啟
+        allow_provider_failover = True
         temperature = 0.1
         max_tokens = 100
         top_p = 1.0
@@ -248,15 +250,16 @@ def test_paste_text_success_returns_true():
 
 
 def test_press_ctrl_v_returns_false_on_controller_error():
-    """pynput controller 異常時，press_ctrl_v 回 False 而非冒泡。"""
-    try:
-        from unittest.mock import patch, MagicMock
-        from utils.keyboard import KeyboardSimulator
-    except ImportError:
-        return  # pynput 不可用 — 優雅跳過
-    bad = MagicMock()
-    bad.press.side_effect = RuntimeError("pynput fail")
-    with patch.object(KeyboardSimulator, "_get_controller", return_value=bad):
+    """按鍵注入異常時，press_ctrl_v 回 False 而非冒泡。
+
+    U9 後 press_ctrl_v 改用 SendInput（要校驗注入結果），所以這裡改 patch
+    _send_input —— 否則測試會對桌面送出真的 Ctrl+V。
+    """
+    from unittest.mock import patch
+
+    from utils.keyboard import KeyboardSimulator
+
+    with patch("utils.keyboard._send_input", side_effect=RuntimeError("注入失敗")):
         assert KeyboardSimulator.press_ctrl_v() is False
 
 

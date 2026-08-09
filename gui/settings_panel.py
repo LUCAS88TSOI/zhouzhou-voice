@@ -147,16 +147,50 @@ class SettingsPanel(QWidget):
 
         # ── 填入當前配置 ──────────────────────────
         self._load_from_config(config)
+        self._snapshot_baseline()
 
         logger.debug("SettingsPanel 已建立")
+
+    # ─────────────────────────────────────────────
+    #  未儲存變更偵測（U10）
+    #
+    #  「← 返回」看起來就像瀏覽器返回，很多人以為等同「完成」。舊行為是
+    #  直接切頁，下次進來 load_config() 把 UI 全部刷回舊值 —— 花五分鐘貼
+    #  API Key、調參數，全部靜默歸零。
+    # ─────────────────────────────────────────────
+
+    def _snapshot_baseline(self) -> None:
+        """記下當前 UI 值，作為「有沒有改過」的比對基準。
+
+        必須深拷貝：RoleTab 是就地改寫同一批 dict 的，共用參考會讓比對
+        永遠相等，髒檢查等於沒做。
+        """
+        import copy
+
+        try:
+            self._baseline = copy.deepcopy(self.get_config())
+        except Exception as err:  # noqa: BLE001
+            logger.warning("建立設定基準失敗: %s", err)
+            self._baseline = None
+
+    def is_dirty(self) -> bool:
+        """UI 上是否有未儲存的變更。"""
+        baseline = getattr(self, "_baseline", None)
+        if baseline is None:
+            return False
+        try:
+            return self.get_config() != baseline
+        except Exception as err:  # noqa: BLE001 — 偵測壞掉不可以困住用戶
+            logger.warning("比對設定變更失敗: %s", err)
+            return False
 
     # ─────────────────────────────────────────────
     #  公開 API
     # ─────────────────────────────────────────────
 
     def refresh_history(self) -> None:
-        """刷新錄音歷史列表。"""
-        self._tab_history._refresh_list()
+        """標記錄音歷史待刷新；分頁沒顯示時不會真的重建表格。"""
+        self._tab_history.mark_dirty()
 
     def load_config(self, config: AppConfig) -> None:
         """
@@ -175,6 +209,7 @@ class SettingsPanel(QWidget):
         self._current_provider_key = ""
 
         self._load_from_config(config)
+        self._snapshot_baseline()
         logger.debug("SettingsPanel 已刷新配置")
 
     def get_config(self) -> AppConfig:
@@ -215,6 +250,7 @@ class SettingsPanel(QWidget):
             repolish_role=self._tab_role.get_repolish_role(),
             polish_timeout=float(self._polish_timeout_spin.value()),
             min_polish_chars=self._min_polish_chars_spin.value(),
+            allow_provider_failover=self._failover_cb.isChecked(),
         )
 
         new_output = OutputConfig(
@@ -475,6 +511,13 @@ class SettingsPanel(QWidget):
             "識別文字達到此字數先會送 LLM 潤色；未達門檻直接輸出原文，跳過潤色。"
         )
         param_form.addRow("字數門檻：", self._min_polish_chars_spin)
+
+        self._failover_cb = QCheckBox("主服務商失敗時改用其他已填 Key 的服務商")
+        self._failover_cb.setToolTip(
+            "預設關閉。開啟後，主服務商失敗時會把同一段逐字稿改送給其他已填 API Key\n"
+            "的服務商 —— 資料會離開你原本指定的收件方，請確認可接受再開啟。"
+        )
+        param_form.addRow("跨服務商降級：", self._failover_cb)
 
         self._top_p_spin = QDoubleSpinBox()
         self._top_p_spin.setRange(0.0, 1.0)
@@ -755,6 +798,7 @@ class SettingsPanel(QWidget):
         # 舊 config 的 0（不限制）已不支援，交由 SpinBox 收斂到下限
         self._polish_timeout_spin.setValue(int(llm.polish_timeout))
         self._min_polish_chars_spin.setValue(llm.min_polish_chars)
+        self._failover_cb.setChecked(llm.allow_provider_failover)
         self._top_p_spin.setValue(llm.top_p)
         self._freq_penalty_spin.setValue(llm.frequency_penalty)
         self._pres_penalty_spin.setValue(llm.presence_penalty)

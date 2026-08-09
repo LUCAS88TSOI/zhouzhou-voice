@@ -33,6 +33,7 @@ def _make_app(llm_config=None, output_config=None):
     # R7：鎖只守這兩個布林，I/O 一律在鎖外進行
     va._is_processing = False
     va._is_repolishing = False
+    va._target_hwnd = 0          # U9：貼上前的目標視窗比對（0 = 不檢查）
     va._hotword = None
     va._recorder = None
     return va
@@ -117,7 +118,11 @@ class TestRunPolishSelection:
 
         mock_polish.assert_called_once()
         assert mock_polish.call_args.args[0] == "原文"
-        mock_paste.assert_called_once_with("潤色後文字", restore=va._config.output.restore_clip)
+        mock_paste.assert_called_once_with(
+            "潤色後文字",
+            restore=va._config.output.restore_clip,
+            expect_hwnd=va._target_hwnd,
+        )
         statuses = [c.args[1][1] for c in mock_gui.call_args_list if c.args[0] == "set_status"]
         assert statuses[-1] == "完成"
 
@@ -139,7 +144,11 @@ class TestRunPolishSelection:
         warnings = [c.args[1][1] for c in mock_gui.call_args_list if c.args[0] == "notify_warning"]
         assert any("潤色選取文字失敗" in w for w in warnings)
         # LLM 失敗仍會貼返原文（result.text 喺失敗時等於選取原文），唔係靜默中斷
-        mock_paste.assert_called_once_with("原文", restore=va._config.output.restore_clip)
+        mock_paste.assert_called_once_with(
+            "原文",
+            restore=va._config.output.restore_clip,
+            expect_hwnd=va._target_hwnd,
+        )
         # 記錄現行行為：LLM 失敗仍以「完成」收尾（狀態列語意屬既有 code review 記錄，非本測試範圍）
         statuses = [c.args[1][1] for c in mock_gui.call_args_list if c.args[0] == "set_status"]
         assert statuses[-1] == "完成"
@@ -160,7 +169,7 @@ class TestRunPolishSelection:
             va._run_polish_selection()
 
         warnings = [c.args[1][1] for c in mock_gui.call_args_list if c.args[0] == "notify_warning"]
-        assert any("貼上失敗" in w for w in warnings)
+        assert any("未能自動貼上" in w for w in warnings)
 
     def test_lock_released_after_run(self):
         va = _make_app()

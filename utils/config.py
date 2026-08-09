@@ -191,6 +191,9 @@ class LLMConfig:
     repolish_provider: str = ""         # 重新潤色專用服務商，空字串 = 使用 active_provider
     repolish_model: str = ""            # 重新潤色專用模型，空字串 = 使用服務商預設模型
     repolish_role: str = ""             # 重新潤色專用角色，空字串 = 使用 active_role
+    # 主服務商失敗時是否允許把同一份逐字稿改送其他已填 key 的服務商。
+    # 預設關閉：資料離開原本指定的收件方屬於隱私決定，必須由用戶明示同意（U14）。
+    allow_provider_failover: bool = False
     polish_timeout: float = 10.0        # 語音潤色逾時上限（秒），超時直接貼原文；0 = 不限制
     min_polish_chars: int = 4           # 識別文字達此字數才送 LLM 潤飾（沿用舊硬編碼 _MIN_LLM_LENGTH 預設值）
 
@@ -302,6 +305,10 @@ class AppConfig:
     """應用總配置（不可變）"""
     version: str = APP_VERSION
     setup_complete: bool = False
+    # 更新提示的記憶（U19）。這是開機自啟的托盤常駐工具，不記住用戶的
+    # 「跳過」／「稍後」就等於每次開機都再打擾一次。
+    skipped_update_version: str = ""   # 用戶明確跳過的版本號
+    update_remind_after: float = 0.0   # unix 時間戳，之前不再提示
     shortcut: ShortcutConfig = field(default_factory=ShortcutConfig)
     asr: ASRConfig = field(default_factory=ASRConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)

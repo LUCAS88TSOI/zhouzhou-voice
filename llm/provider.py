@@ -140,7 +140,16 @@ def get_active_provider(config: Any) -> ProviderInfo | None:
         )
         return info
 
-    # Bug 4 修復：當指定的 provider 不可用時，嘗試其他可用 provider
+    # 指定的 provider 不可用。偷偷改用別家 = 把逐字稿送去用戶沒選的地方（U14），
+    # 所以只有在用戶明示開啟 allow_provider_failover 時才 fallback。
+    if not getattr(llm_config, "allow_provider_failover", False):
+        logger.warning(
+            "活躍服務商 '%s' (%s) 未配置 API Key；未開啟跨服務商降級，不自動改用其他服務商",
+            active_key,
+            info.name,
+        )
+        return None
+
     logger.warning(
         "活躍服務商 '%s' (%s) 不可用，嘗試其他 provider...",
         active_key,

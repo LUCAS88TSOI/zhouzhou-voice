@@ -75,8 +75,9 @@ def _resolve_mouse_button(name: str):
 
 
 def _get_vk_code(name: str) -> Optional[int]:
-    """取得 Windows 虛擬鍵碼（用於 win32_event_filter）。"""
+    """取得 Windows 虛擬鍵碼（用於 win32_event_filter 與 key-up watchdog）。"""
     vk_map = {
+        "x1": 0x05, "x2": 0x06,          # VK_XBUTTON1 / VK_XBUTTON2
         "caps_lock": 0x14, "space": 0x20, "insert": 0x2D,
         "shift": 0xA0, "shift_l": 0xA0, "shift_r": 0xA1,
         "ctrl": 0xA2, "ctrl_l": 0xA2, "ctrl_r": 0xA3,
@@ -92,6 +93,20 @@ def _get_vk_code(name: str) -> Optional[int]:
     if len(name) == 1 and name.isalpha():
         return ord(name.upper())
     return None
+
+
+def _physical_key_down(vk: int) -> bool:
+    """查詢實體按鍵此刻是否仍被按住（Windows）。
+
+    無法查詢時保守回 True —— 誤判成「已鬆開」會攔腰砍掉正在進行的錄音，
+    比卡住更糟。
+    """
+    try:
+        import ctypes
+
+        return bool(ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000)
+    except Exception:
+        return True
 
 
 def _key_matches(pressed, target, key_name: str) -> bool:
@@ -115,6 +130,10 @@ class HotkeyListener:
     長按超過 threshold 觸發 on_activate，鬆開觸發 on_deactivate。
     短按（低於 threshold）時若 suppress=True，會自動補發按鍵。
     """
+
+    # 按住期間多久核對一次實體按鍵狀態（秒）。太短會空轉，太長會讓卡住的
+    # 使用者等太久 —— 2 秒的延遲在「按了沒反應」的情境下已經可以接受。
+    WATCHDOG_INTERVAL = 2.0
 
     def __init__(
         self,
@@ -155,6 +174,12 @@ class HotkeyListener:
         # - on_threshold_reached 執行 on_activate 後 set()
         # - _handle_release 若 was_activated=True 則 wait()（超時 2 秒）
         self._activate_completed = threading.Event()
+
+        # U6：key-up 遺失的復原路徑。UAC 提權彈窗切安全桌面、Win+L、全螢幕
+        # 獨佔遊戲都會讓 release 事件永遠收不到，之後 _handle_press 的
+        # 「已按下就早退」會讓快捷鍵徹底失效，只能重啟程式。
+        # 按住期間週期性用 GetAsyncKeyState 核對實體狀態，對不上就強制復位。
+        self._watchdog_timer: Optional[threading.Timer] = None
 
         self._kb_listener = None
         self._mouse_listener = None
@@ -318,6 +343,9 @@ class HotkeyListener:
             self._threshold_timer.daemon = True
             self._threshold_timer.start()
 
+        # 守望實體按鍵狀態，接住遺失的 key-up（U6）
+        self._start_watchdog(my_gen)
+
         # 補發在鎖外執行，避免長時間持鎖（_schedule_reemit 會 spawn thread）
         if self._suppress and self._key_name == "caps_lock":
             self._schedule_reemit()
@@ -404,6 +432,54 @@ class HotkeyListener:
         if self._threshold_timer is not None:
             self._threshold_timer.cancel()
             self._threshold_timer = None
+        if self._watchdog_timer is not None:
+            self._watchdog_timer.cancel()
+            self._watchdog_timer = None
+
+    # ─── key-up 遺失的 watchdog（U6） ──────────────────
+
+    def _start_watchdog(self, generation: int) -> None:
+        """排下一次實體按鍵狀態核對。
+
+        只在監聽器真的啟動後才守望：未 start() 就沒有 pynput 回調，
+        也就不存在「key-up 遺失」，此時排 timer 只會留下背景執行緒。
+        """
+        if not self._running or _get_vk_code(self._key_name) is None:
+            return
+        timer = threading.Timer(
+            self.WATCHDOG_INTERVAL, self._watchdog_tick, args=(generation,),
+        )
+        timer.daemon = True
+        with self._state_lock:
+            if generation != self._press_generation or not self._is_pressed:
+                return
+            self._watchdog_timer = timer
+        timer.start()
+
+    def _watchdog_tick(self, generation: int) -> None:
+        """核對實體按鍵：仍按著就續期，已鬆開就強制復位。"""
+        with self._state_lock:
+            if generation != self._press_generation or not self._is_pressed:
+                return
+            vk = _get_vk_code(self._key_name)
+
+        if vk is None or _physical_key_down(vk):
+            self._start_watchdog(generation)
+            return
+
+        logger.warning(
+            "偵測到快捷鍵 %s 的 key-up 遺失（實體鍵已鬆開），強制復位",
+            self._key_name,
+        )
+        self._handle_release()
+
+    def force_release(self) -> None:
+        """強制走一次 release 流程。
+
+        給 watchdog 與「錄音達上限」使用：已錄到的音頻必須走完識別流程，
+        而不是卡在 _is_pressed=True 直到程式重啟。
+        """
+        self._handle_release()
 
     def _schedule_reemit(self) -> None:
         """延遲補發按鍵（避免在鉤子回調中直接發送）。"""

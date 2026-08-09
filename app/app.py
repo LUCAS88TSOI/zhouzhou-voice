@@ -112,6 +112,14 @@ class VoiceApp:
     _ASR_MAX_RESTARTS = 3
     _ASR_RESTART_COOLDOWN = 30.0  # 秒
 
+    # LLM 從未配置時的引導提示：每個 session 只彈一次（U1）。
+    # 內建免費 key 已停用，新用戶不設 key 就會每講一句被打斷一次。
+    _llm_hint_shown: bool = False
+    _LLM_NOT_CONFIGURED_HINT = (
+        "尚未設定 LLM 服務商，本次已直接貼出識別原文。\n"
+        "如需潤色請到 設定 → LLM 填入 API Key"
+    )
+
     def __init__(self) -> None:
         self._config: AppConfig | None = None
         self._lifecycle = LifecycleManager()
@@ -156,6 +164,11 @@ class VoiceApp:
         self._is_processing: bool = False
         self._is_repolishing: bool = False
         self._processing_lock = threading.Lock()
+
+        # U1：LLM 未配置的引導提示只彈一次；U14：降級提示只在服務商真的換了才彈
+        self._llm_hint_shown: bool = False
+        # U9：開口／觸發當下的目標視窗 handle，貼上前比對（0 = 未知，不檢查）
+        self._target_hwnd: int = 0
 
         # 文件轉錄 single-flight guard
         # iter 3 Bug E：與 _is_processing 對稱，用 Lock 確保 check-and-set 原子性
@@ -372,10 +385,27 @@ class VoiceApp:
 
         - AudioRecorder 已將 _is_recording 設為 False，不會再追加新音頻
         - 透過 _invoke_gui 通知主線程更新浮窗狀態（會顯示「已達錄音上限」）
-        - 主流程仍會在快捷鍵釋放時正常呼叫 stop_recording()，已錄音頻會走完整識別流程
+        - 主動 force_release()：不能假設快捷鍵一定還會送出 key-up（U6）。
+          真的遺失時舊行為是這 30 分鐘音頻永不識別、永不入歷史。
         """
         logger.warning("錄音達到上限，自動停止追加")
         self._invoke_gui("set_status", (str, "已達錄音上限"))
+
+        hotkey = getattr(self, "_hotkey", None)
+        if hotkey is None:
+            return
+
+        def _release() -> None:
+            try:
+                hotkey.force_release()
+            except Exception as err:
+                logger.error("錄音上限強制釋放快捷鍵失敗: %s", err)
+
+        # 本方法跑在 sounddevice 的音頻回調線程上，而 force_release 會一路
+        # 走到 _on_recording_stop（30 分鐘音頻的 concatenate + spawn worker）。
+        # 不能把音頻回調卡在那裡，丟到背景線程做。
+        if self._spawn_worker(_release, name="hotkey-force-release") is None:
+            _release()   # shutdown 中拒絕 spawn：寧可同步做，也不要丟掉錄音
 
     def _resolve_model_dir(self) -> Path:
         """根據配置中的模型 key 找到對應的模型目錄。"""
@@ -655,9 +685,7 @@ class VoiceApp:
                         info.remote_version,
                         APP_VERSION,
                     )
-                    tray = self._main_window._tray
-                    tray.show_update_available(info)
-                    self._show_update_dialog(info)
+                    self._announce_update(info)
                 else:
                     logger.debug("版本已是最新: %s", info.remote_version)
 
@@ -666,12 +694,61 @@ class VoiceApp:
         except Exception as err:
             logger.warning("版本檢查初始化失敗（已忽略）: %s", err)
 
+    def _announce_update(self, info: object) -> None:
+        """告知有新版本 —— 托盤入口 + 氣泡，不彈 modal（U19）。
+
+        這是開機自啟的托盤常駐工具：用戶開機坐下就開始打字，modal 憑空
+        跳出會搶走鍵盤焦點、吃掉正在輸入的字。要看詳情就點托盤那一項。
+        """
+        version = getattr(info, "remote_version", "")
+        cfg = self._config
+        if cfg is not None:
+            if version and version == cfg.skipped_update_version:
+                logger.info("版本 %s 已被使用者跳過，不再提示", version)
+                return
+            if time.time() < cfg.update_remind_after:
+                logger.info("更新提示仍在「稍後提醒」期間，本次略過")
+                return
+
+        try:
+            self._main_window._tray.show_update_available(info)
+        except Exception as err:
+            logger.warning("托盤更新入口顯示失敗: %s", err)
+
+        self._invoke_gui(
+            "notify_warning",
+            (str, f"有新版本 v{version} 可用，右鍵托盤圖示 → 「有新版本」即可更新"),
+        )
+
+    def _apply_update_decision(self, decision: str, info: object) -> None:
+        """把對話框的「跳過 / 稍後」寫回 config，否則下次開機又彈（U19）。"""
+        if decision not in ("skip", "later") or self._config is None:
+            return
+
+        if decision == "skip":
+            new_config = replace(
+                self._config,
+                skipped_update_version=getattr(info, "remote_version", ""),
+            )
+        else:
+            new_config = replace(
+                self._config, update_remind_after=time.time() + 24 * 3600,
+            )
+
+        self._config = new_config
+        try:
+            ConfigManager.save(new_config)
+            logger.info("更新提示決定已記錄: %s", decision)
+        except Exception as err:
+            logger.error("寫入更新提示決定失敗: %s", err)
+
     def _show_update_dialog(self, info: object) -> None:
-        """彈出更新對話框。"""
+        """彈出更新對話框（僅由托盤入口觸發，不會自動彈出）。"""
         try:
             from gui.update_dialog import UpdateDialog
             dialog = UpdateDialog(info, parent=self._main_window)
             dialog.exec()
+            self._apply_update_decision(dialog.decision, info)
         except Exception as err:
             logger.warning("更新對話框顯示失敗: %s", err)
 
@@ -783,12 +860,14 @@ class VoiceApp:
             return
         if not self._last_result:
             return
+        self._target_hwnd = self._capture_target_window()
         self._spawn_worker(self._run_repolish, name="repolish-worker")
 
     def _on_polish_selection_activate(self) -> None:
         """潤色選取文字快捷鍵觸發：在背景線程讀取選取文字並重新潤色。"""
         if self._recorder is not None and self._recorder.is_recording:
             return
+        self._target_hwnd = self._capture_target_window()
         self._spawn_worker(self._run_polish_selection, name="polish-selection-worker")
 
     def _run_polish_selection(self) -> None:
@@ -829,10 +908,13 @@ class VoiceApp:
             self._invoke_gui("append_result", (str, f"[潤色選取] {polished}"))
 
             restore = self._config.output.restore_clip if self._config else False
-            if not ClipboardManager.paste_text(polished, restore=restore):
+            if not ClipboardManager.paste_text(
+                polished, restore=restore, expect_hwnd=self._target_hwnd,
+            ):
                 self._invoke_gui(
                     "notify_warning",
-                    (str, "⚠ 貼上失敗，結果已喺剪貼板，可手動 Ctrl+V"),
+                    (str, "⚠ 未能自動貼上（視窗已切換或目標拒絕輸入）"
+                          "，結果已喺剪貼板，可手動 Ctrl+V"),
                 )
         except Exception as err:
             logger.error("潤色選取文字異常: %s", err, exc_info=True)
@@ -961,7 +1043,9 @@ class VoiceApp:
             self._invoke_gui("set_status", (str, "LLM 處理中..."))
             result = self._try_llm_polish(source, role_override=repolish_role, llm_processor=llm_processor)
             polished = result.text
-            if not result.success:
+            if result.not_configured:
+                self._notify_llm_not_configured()
+            elif not result.success:
                 self._invoke_gui(
                     "notify_warning",
                     (str, "⚠ 重新潤色失敗（請檢查網絡或 API Key）"),
@@ -974,11 +1058,14 @@ class VoiceApp:
             if self._config and self._config.output.paste_mode:
                 from utils.clipboard import ClipboardManager
                 if not ClipboardManager.paste_text(
-                    polished, restore=self._config.output.restore_clip
+                    polished,
+                    restore=self._config.output.restore_clip,
+                    expect_hwnd=self._target_hwnd,
                 ):
                     self._invoke_gui(
                         "notify_warning",
-                        (str, "⚠ 貼上失敗，結果已喺剪貼板，可手動 Ctrl+V"),
+                        (str, "⚠ 未能自動貼上（視窗已切換或目標拒絕輸入）"
+                          "，結果已喺剪貼板，可手動 Ctrl+V"),
                     )
         except Exception as err:
             logger.error("重新潤色異常: %s", err, exc_info=True)
@@ -1037,10 +1124,29 @@ class VoiceApp:
 
         錄音器不可用時給出明確 UI 反饋（狀態列 + 托盤氣泡），
         不可靜默 return——否則使用者只會看到「按了沒反應」。
+
+        上一段仍在處理時直接拒絕開錄（U5）：舊行為是照常收音、狀態列寫
+        「錄音中...」，鬆手才靜默丟棄 —— 用戶整段話白講，還會誤以為是
+        識別錯誤。第一時間講清楚，他就不用開口。
         """
+        with self._processing_lock:
+            busy = self._is_processing or self._is_repolishing
+        if busy:
+            logger.info("上一段仍在處理中，拒絕開始新錄音")
+            self._invoke_gui("set_status", (str, "上一段處理中"))
+            self._invoke_gui(
+                "notify_warning", (str, "⚠ 上一段仍在處理中，請稍候再說"),
+            )
+            return
+
         if not self._ensure_recorder():
             self._invoke_gui("set_status", (str, "未偵測到麥克風"))
             return
+
+        # 記下開口當下的目標視窗：潤色管線可耗 10-30 秒，貼上前要確認
+        # 用戶沒有切走（U9）
+        self._target_hwnd = self._capture_target_window()
+
         self._recorder.start_recording()
         logger.info("錄音開始")
         self._invoke_gui("set_status", (str, "錄音中..."))
@@ -1070,9 +1176,20 @@ class VoiceApp:
         # 所以這段臨界區必須是微秒級 —— 任何 I/O 都不得在持鎖時進行（R7）。
         with self._processing_lock:
             if self._is_processing or self._is_repolishing:
-                logger.warning("上一次處理還在進行中，忽略本次")
-                return
-            self._is_processing = True
+                busy = True
+            else:
+                busy = False
+                self._is_processing = True
+        if busy:
+            # _on_recording_start 已擋在前面，走到這裡代表競態。仍要出聲：
+            # 靜默丟棄 = 用戶白講一整段還不知道（U5）
+            logger.warning("上一次處理還在進行中，本段錄音已丟棄")
+            self._invoke_gui("set_status", (str, "上一段處理中"))
+            self._invoke_gui(
+                "notify_warning",
+                (str, "⚠ 上一段仍在處理中，本次錄音未送出，請重講"),
+            )
+            return
 
         logger.info("錄音完成: %.1f 秒, %d bytes", duration, len(audio_bytes))
 
@@ -1188,6 +1305,9 @@ class VoiceApp:
                 if result.success:
                     if timings["LLM"] > 0.01:
                         logger.info("LLM 潤色後: %s", text)
+                elif result.not_configured:
+                    # 「還沒設定」不是失敗：整個 session 只提示一次（U1）
+                    self._notify_llm_not_configured()
                 elif result.error == "潤色逾時":
                     # 逾時 → 貼原文 + 專屬提示
                     _to = int(self._config.llm.polish_timeout)
@@ -1253,10 +1373,12 @@ class VoiceApp:
                 if not ClipboardManager.paste_text(
                     text,
                     restore=self._config.output.restore_clip,
+                    expect_hwnd=self._target_hwnd,
                 ):
                     self._invoke_gui(
                         "notify_warning",
-                        (str, "⚠ 貼上失敗，結果已喺剪貼板，可手動 Ctrl+V"),
+                        (str, "⚠ 未能自動貼上（視窗已切換或目標拒絕輸入）"
+                          "，結果已喺剪貼板，可手動 Ctrl+V"),
                     )
 
             # 流水線完整走到底且 text 非空 → 明確成功
@@ -1493,6 +1615,47 @@ class VoiceApp:
         logger.info("分段識別完成: %d 段拼接 → %d 字", total_segs, len(merged))
         return AsrOutcome(text=merged)
 
+    @staticmethod
+    def _capture_target_window() -> int:
+        """記下當前前景視窗，作為稍後貼上的預期目標（U9）。
+
+        取不到時回 0（= 不檢查）：偵測失敗不該癱瘓貼上這個主功能。
+        """
+        try:
+            from utils.clipboard import foreground_window
+
+            return foreground_window()
+        except Exception as err:  # noqa: BLE001
+            logger.warning("記錄目標視窗失敗: %s", err)
+            return 0
+
+    def _notify_llm_not_configured(self) -> None:
+        """LLM 從未配置的一次性引導提示（U1）。
+
+        「還沒設定」不是失敗，不該每句話都彈一次，更不該叫用戶去檢查網絡。
+        """
+        if self._llm_hint_shown:
+            return
+        self._llm_hint_shown = True
+        logger.info("LLM 未配置，顯示一次性引導提示")
+        self._invoke_gui("notify_warning", (str, self._LLM_NOT_CONFIGURED_HINT))
+
+    def _notify_provider_switch(self, used_provider: str) -> None:
+        """潤色實際由別家服務商完成時告知用戶（U14）。"""
+        configured = self._config.llm.active_provider if self._config else ""
+        if not used_provider or used_provider == configured:
+            return
+        name = used_provider
+        if self._config:
+            name = self._config.llm.providers.get(used_provider, {}).get(
+                "name", used_provider,
+            )
+        logger.warning("LLM 主服務商失敗，實際由 %s 完成潤色", used_provider)
+        self._invoke_gui(
+            "notify_warning",
+            (str, f"⚠ 主服務商失敗，本次潤色已改用「{name}」（{used_provider}）完成"),
+        )
+
     def _try_llm_polish(
         self, text: str, role_override: str = "", llm_processor=None,
         enforce_timeout: bool = False,
@@ -1582,6 +1745,17 @@ class VoiceApp:
                     error="潤色回覆被 max_tokens 截斷",
                 )
 
+            # 從未配置服務商 → 不是失敗，不往結果區塞錯誤行（U1）
+            if getattr(result, "not_configured", False):
+                logger.info("LLM 尚未配置，直接沿用原文")
+                return LLMResultStatus(
+                    success=False,
+                    text=text,
+                    was_processed=False,
+                    error=result.error,
+                    not_configured=True,
+                )
+
             # 有錯誤 → 顯示到主視窗讓用戶知道
             if result.error:
                 error_msg = f"[LLM] {result.error}"
@@ -1593,6 +1767,9 @@ class VoiceApp:
                     was_processed=True,
                     error=result.error
                 )
+
+            # 潤色由別家服務商完成 → 明示告知（U14）
+            self._notify_provider_switch(getattr(result, "used_provider", ""))
 
             # 參數容錯警告 → 通知用戶
             if result.warnings:

@@ -13,7 +13,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import TYPE_CHECKING, List, Optional
 
-from PySide6.QtCore import Qt, Signal, Slot
+from PySide6.QtCore import Qt, QTimer, Signal, Slot
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QLineEdit,
     QMenu,
     QMessageBox,
     QPushButton,
@@ -31,7 +32,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from core.recording_db import RecordingDatabase, RecordingRecord
+from core.recording_db import RecordingDatabase, RecordingMeta
 from gui.widgets.audio_player import AudioPlayerWidget
 from utils.logger import get_logger
 
@@ -47,6 +48,10 @@ class HistoryTab(QWidget):
     # 信號：請求重新處理錄音（record_id, role_id）
     reprocess_requested = Signal(int, str)
 
+    PAGE_SIZE = 100
+    SEARCH_DEBOUNCE_MS = 300
+    TEXT_PREVIEW_CHARS = 50
+
     def __init__(
         self,
         db: RecordingDatabase,
@@ -54,10 +59,31 @@ class HistoryTab(QWidget):
     ) -> None:
         super().__init__(parent)
         self._db = db
-        self._records: List[RecordingRecord] = []
+        self._records: List[RecordingMeta] = []
+        self._page_size = self.PAGE_SIZE
+        self._shown = self.PAGE_SIZE
+        self._keyword = ""
+        self._dirty = False
 
         self._build_ui()
         self._refresh_list()
+
+    # ── 刷新排程 ──────────────────────────────
+    #
+    # refresh_history 是每次語音輸入完成都會走的路徑。重建 100 列表格
+    # （300 個 item + 200 顆按鈕）在主線程做，講完話貼上就會頓一下 ——
+    # 而設定頁多數時間根本沒打開。所以隱藏時只記帳，可見時才付錢。
+
+    def mark_dirty(self) -> None:
+        """標記歷史已變動；分頁可見時立即刷新，否則等 showEvent。"""
+        self._dirty = True
+        if self.isVisible():
+            self._refresh_list()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if self._dirty:
+            self._refresh_list()
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
@@ -91,6 +117,21 @@ class HistoryTab(QWidget):
 
         layout.addLayout(settings_row)
 
+        # ── 搜尋列 ──────────────────────────────
+        search_row = QHBoxLayout()
+        search_row.addWidget(QLabel("搜尋："))
+        self._search_edit = QLineEdit()
+        self._search_edit.setPlaceholderText("輸入關鍵字搜尋識別結果或潤色結果…")
+        self._search_edit.setClearButtonEnabled(True)
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(self.SEARCH_DEBOUNCE_MS)
+        self._search_timer.timeout.connect(self._apply_search)
+        self._search_edit.textChanged.connect(lambda _: self._search_timer.start())
+        self._search_edit.returnPressed.connect(self._apply_search)
+        search_row.addWidget(self._search_edit, stretch=1)
+        layout.addLayout(search_row)
+
         # ── 中間：錄音列表 ──────────────────────
         self._table = QTableWidget()
         self._table.setColumnCount(5)
@@ -111,6 +152,7 @@ class HistoryTab(QWidget):
         self._table.setAlternatingRowColors(True)
         self._table.setContextMenuPolicy(Qt.CustomContextMenu)
         self._table.customContextMenuRequested.connect(self._on_context_menu)
+        self._table.itemDoubleClicked.connect(self._on_item_double_clicked)
         layout.addWidget(self._table, stretch=1)
 
         # ── 底部：播放器 + 操作 ──────────────────
@@ -130,9 +172,16 @@ class HistoryTab(QWidget):
 
         layout.addLayout(bottom_row)
 
-        # ── 記錄數量標籤 ────────────────────────
+        # ── 記錄數量 + 載入更多 ──────────────────
+        count_row = QHBoxLayout()
         self._count_label = QLabel("共 0 筆記錄")
-        layout.addWidget(self._count_label)
+        count_row.addWidget(self._count_label)
+        count_row.addStretch()
+        self._more_btn = QPushButton("載入更多")
+        self._more_btn.clicked.connect(self._on_load_more)
+        self._more_btn.setVisible(False)
+        count_row.addWidget(self._more_btn)
+        layout.addLayout(count_row)
 
     def load_config(self, config: "AppConfig") -> None:
         """載入配置"""
@@ -166,8 +215,11 @@ class HistoryTab(QWidget):
         logger.debug("角色列表已刷新: %d 個角色", self._role_combo.count() - 1)
 
     def _refresh_list(self) -> None:
-        """刷新錄音列表"""
-        self._records = self._db.get_recent(limit=100)
+        """刷新錄音列表（只取中繼資料，音訊按需再撈）"""
+        self._dirty = False
+        self._records = self._db.get_recent_meta(
+            limit=self._shown, keyword=self._keyword,
+        )
 
         self._table.setRowCount(len(self._records))
         for row, rec in enumerate(self._records):
@@ -179,11 +231,16 @@ class HistoryTab(QWidget):
             dur_str = f"{rec.duration:.1f}s"
             self._table.setItem(row, 1, QTableWidgetItem(dur_str))
 
-            # 識別結果（截斷）
-            text = rec.llm_text or rec.asr_text
-            if len(text) > 50:
-                text = text[:50] + "..."
-            self._table.setItem(row, 2, QTableWidgetItem(text))
+            # 識別結果（截斷顯示，完整內容放 tooltip）
+            full_text = rec.display_text
+            shown = (
+                full_text[:self.TEXT_PREVIEW_CHARS] + "..."
+                if len(full_text) > self.TEXT_PREVIEW_CHARS
+                else full_text
+            )
+            text_item = QTableWidgetItem(shown)
+            text_item.setToolTip(full_text)
+            self._table.setItem(row, 2, text_item)
 
             # 角色
             role_display = rec.role_id if rec.role_id else "-"
@@ -213,13 +270,47 @@ class HistoryTab(QWidget):
 
             self._table.setCellWidget(row, 4, btn_widget)
 
-        self._count_label.setText(f"共 {self._db.count()} 筆記錄")
-        logger.info("錄音歷史已刷新: %d 筆", len(self._records))
+        total = self._db.count(keyword=self._keyword)
+        loaded = len(self._records)
+        scope = f"符合「{self._keyword}」共 {total} 筆" if self._keyword else f"共 {total} 筆記錄"
+        self._count_label.setText(
+            f"顯示 {loaded} ／ {scope}" if loaded < total else scope
+        )
+        self._more_btn.setVisible(loaded < total)
+        logger.info("錄音歷史已刷新: %d/%d 筆", loaded, total)
 
     @Slot()
-    def _on_play(self, record: RecordingRecord) -> None:
-        """播放選中的錄音"""
-        self._player.load_wav(record.audio_data)
+    def _apply_search(self) -> None:
+        """套用搜尋關鍵字（下推到 SQL），並把分頁視窗重置回第一頁。"""
+        self._search_timer.stop()
+        self._keyword = self._search_edit.text().strip()
+        self._shown = self._page_size
+        self._refresh_list()
+
+    @Slot()
+    def _on_load_more(self) -> None:
+        """再多載一頁"""
+        self._shown += self._page_size
+        self._refresh_list()
+
+    @Slot()
+    def _on_item_double_clicked(self, item: QTableWidgetItem) -> None:
+        """雙擊任一列複製該筆完整文字"""
+        row = item.row()
+        if 0 <= row < len(self._records):
+            text = self._records[row].display_text
+            if text:
+                QApplication.clipboard().setText(text)
+                logger.debug("已複製歷史記錄全文: %d 個字元", len(text))
+
+    @Slot()
+    def _on_play(self, record: RecordingMeta) -> None:
+        """播放選中的錄音（此時才按 id 撈 WAV blob）"""
+        full = self._db.get_by_id(record.id)
+        if full is None:
+            logger.warning("錄音記錄已不存在: id=%d", record.id)
+            return
+        self._player.load_wav(full.audio_data)
         self._player._toggle_play()
 
     @Slot()
@@ -263,7 +354,7 @@ class HistoryTab(QWidget):
         if row < 0 or row >= len(self._records):
             return
         record = self._records[row]
-        text = record.llm_text or record.asr_text
+        text = record.display_text
         if not text:
             return
 

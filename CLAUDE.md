@@ -22,6 +22,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   ```
 - 代碼精簡：能用一行不用三行，能刪冗餘方法就刪
 
+## 待辦清單
+
+- [docs/AUDIT-2026-08.md](docs/AUDIT-2026-08.md)：全面審查的 53 條發現與修復狀態（必修 R1–R15 已完成，UX 痛點 U1–U23 與優化 O1–O6 待辦）
+- 任務計劃一律存成專案內的 md 檔，不用 artifact
+
 ## 測試與驗證
 
 - `tools/asr_benchmark.py`：CLI 工具，比較所有已安裝 ASR 模型的識別速度與準確率
