@@ -35,6 +35,23 @@ _DEFAULT_TIMEOUT: int = 30
 _SSE_DONE_SENTINEL: str = "[DONE]"
 _CHAT_COMPLETIONS_PATH: str = "/chat/completions"
 
+# 串流總時長硬上限（最後防線）：read timeout 只約束「單次 socket read」，
+# 服務商持續送 keep-alive 心跳時每次 read 都成功，總時長可以無限拉長。
+# 呼叫端冇傳 should_stop（或用戶把 polish_timeout 設成 0=不限制）時，冇呢個
+# 上限就會永遠卡死。取 read timeout 的倍數並設地板值，確保絕對唔會誤殺正常
+# 長輸出（實測正常潤色 2–10s、檔案轉譯逐段數十秒）。
+_STREAM_BUDGET_FACTOR: float = 10.0
+_STREAM_BUDGET_FLOOR: float = 180.0
+# 絕對天花板：手改 config 把 polish_timeout 設成 3600 時，倍數會令硬上限
+# 放大到幾十小時，等於冇上限。任何情況下單次串流唔應該超過 5 分鐘。
+_STREAM_BUDGET_CEILING: float = 300.0
+
+# 逐塊讀取的大小，以及回應長度上限（惡意／故障端點可以無視 max_tokens，
+# 持續送 bytes 令記憶體線性增長）
+_SSE_READ_CHUNK_BYTES: int = 4096
+_MAX_SSE_LINE_BYTES: int = 1 << 20      # 單行 1MB
+_MAX_SSE_TOTAL_BYTES: int = 64 << 20    # 整個回應 64MB
+
 # 全局連線池（所有 LLMClient 共享，重用 TCP+TLS 連線）
 _POOL_MANAGER: urllib3.PoolManager = urllib3.PoolManager(
     num_pools=4,       # 最多 4 個不同 host 的連線池
@@ -345,25 +362,45 @@ class LLMClient:
         # 否則 finally 判斷唔到要 close() 定 release_conn()（code review MEDIUM）。
         # 有傳 meta 時 _local_meta 就係同一個物件，寫入照舊會反映到呼叫端。
         _local_meta: dict[str, Any] = meta if meta is not None else {}
+        # 最後防線：即使呼叫端完全冇傳 should_stop，串流總時長仍受硬上限約束
+        deadline = time.monotonic() + min(
+            max(self._timeout * _STREAM_BUDGET_FACTOR, _STREAM_BUDGET_FLOOR),
+            _STREAM_BUDGET_CEILING,
+        )
+        completed = False
         try:
-            yield from self._parse_sse_stream(response, _local_meta, should_stop)
+            yield from self._parse_sse_stream(
+                response, _local_meta, should_stop, deadline,
+            )
+            completed = True
         except Exception as err:
             msg = f"串流解析錯誤：{err}"
             logger.error(msg)
             raise RuntimeError(msg)
         finally:
-            if _local_meta.get("stopped"):
-                # 逾時主動中止：連線可能仲有未讀資料（服務商仲喺度產生 token），
+            if completed and not _local_meta.get("stopped"):
+                # `[DONE]` 之後仲有 chunked terminator 未讀 —— release_conn()
+                # 唔檢查連線是否已排空，未排空就放返池等於留低髒連線。
+                # drain_conn() 係 urllib3 官方做法：讀走殘留（正常情況只得幾個
+                # bytes）。端點喺 [DONE] 之後死唔閉嘴時最壞卡一個 read timeout，
+                # 有界，之後 release 一條已斷的連線亦無害。
+                drain = getattr(response, "drain_conn", None)
+                if drain is not None:
+                    try:
+                        drain()
+                    except Exception:
+                        pass
+                response.release_conn()
+            else:
+                # 任何提早中止（逾時、外層 break 觸發 GeneratorExit、解析例外）
+                # 都代表連線仲有未讀資料（服務商仲喺度產生 token）。
                 # release_conn() 唔會關閉 socket，只會將「未讀完」嘅連線放返
-                # 連線池 —— 若殘留 bytes 未及時到達，下個請求可能複用到呢條
-                # 骯髒連線、解析到殘留 SSE 內容。主動中止時要 close() 唔可以
-                # release_conn()，確保連線唔會被重用（code review MEDIUM）。
+                # 連線池 —— 下個請求可能複用到呢條骯髒連線、解析到殘留 SSE
+                # 內容。必須 close() 確保連線唔會被重用。
                 try:
                     response.close()
                 except Exception:
                     pass
-            else:
-                response.release_conn()
 
     def chat_sync(self, messages: list[dict[str, str]]) -> str:
         """
@@ -396,7 +433,12 @@ class LLMClient:
         messages: list[dict[str, str]],
         warnings: list[str],
     ) -> str:
-        """內部實作：非串流 chat，警告 append 到外部 list。"""
+        """內部實作：非串流 chat，警告 append 到外部 list。
+
+        注意：此路徑只有 per-read timeout，冇串流路徑嘅 wall-clock 硬上限
+        （`_STREAM_BUDGET_*`）。目前生產程式碼一律走 stream=True，日後若為
+        某服務商切 stream=False，逾時防線會一次過失效，要一併補上。
+        """
         request = self._build_chat_request(messages, stream=False)
 
         headers = {
@@ -618,6 +660,7 @@ class LLMClient:
         response: Any,
         meta: dict[str, Any] | None = None,
         should_stop: Callable[[], bool] | None = None,
+        deadline: float | None = None,
     ) -> Generator[str, None, None]:
         """
         解析 SSE 串流回應。
@@ -632,45 +675,131 @@ class LLMClient:
             meta: 若給定，串流結束時寫入 meta["finish_reason"]。
                   呼叫端據此判斷回覆是否被 max_tokens 截斷（"length"），
                   否則半截文字會被當成完整結果貼出去。
-            should_stop: 若給定，每收到一行（包括 keep-alive／註解行，
-                  唔止有內容嗰啲）就檢查一次；逾時即中止讀取並在
-                  meta["stopped"] 標記 True，避免心跳行拖住逾時保護。
+            should_stop: 若給定，每讀到一塊 bytes（唔係每行）就檢查一次；
+                  逾時即中止讀取並在 meta["stopped"] 標記 True。
+            deadline: 串流總時長硬上限（time.monotonic() 基準）。與 should_stop
+                  獨立 —— 呼叫端冇傳 should_stop 時由它兜底，確保任何配置下
+                  都唔會無限卡死。
+
+        逐塊（唔係逐行）讀取的原因見 `_iter_raw_chunks`。
         """
-        for raw_line in response:
+        def _abort(reason: str) -> None:
+            logger.warning("SSE 串流中止：%s", reason)
+            if meta is not None:
+                meta["stopped"] = True
+
+        buffer = bytearray()
+        total = 0
+
+        for chunk in LLMClient._iter_raw_chunks(response):
+            if deadline is not None and time.monotonic() >= deadline:
+                _abort("超過串流總時長硬上限")
+                return
+
             if should_stop is not None and should_stop():
                 logger.info("SSE 串流讀取中偵測到 should_stop，中止讀取")
                 if meta is not None:
                     meta["stopped"] = True
                 return
 
-            line = raw_line.decode("utf-8", errors="replace").strip()
-
-            if not line:
-                continue
-
-            if not line.startswith("data:"):
-                continue
-
-            data_str = line[len("data:"):].strip()
-
-            if data_str == _SSE_DONE_SENTINEL:
-                logger.debug("SSE 串流結束: 收到 [DONE]")
+            total += len(chunk)
+            if total > _MAX_SSE_TOTAL_BYTES:
+                _abort(f"回應累計超過 {_MAX_SSE_TOTAL_BYTES} bytes")
                 return
 
-            try:
-                data = json.loads(data_str)
-            except json.JSONDecodeError:
-                logger.debug("SSE 行 JSON 解析跳過: %s", data_str[:80])
-                continue
+            buffer.extend(chunk)
 
-            if meta is not None:
-                reason = _extract_finish_reason(data)
-                if reason:
+            while True:
+                idx, skip = LLMClient._find_line_end(buffer)
+                if idx < 0:
+                    break
+                raw_line = bytes(buffer[:idx])
+                del buffer[: idx + skip]
+
+                content, reason, is_done = LLMClient._parse_sse_line(raw_line)
+                if is_done:
+                    logger.debug("SSE 串流結束: 收到 [DONE]")
+                    return
+                if reason and meta is not None:
                     meta["finish_reason"] = reason
+                if content:
+                    yield content
 
-            content = _extract_delta_content(data)
-            if content:
-                yield content
+            # 對端只送 bytes 唔送換行 → buffer 會無限增長
+            if len(buffer) > _MAX_SSE_LINE_BYTES:
+                _abort(f"單行超過 {_MAX_SSE_LINE_BYTES} bytes（對端可能唔送換行）")
+                return
+
+        # 串流自然結束，但最後一行冇換行結尾
+        if buffer:
+            content, reason, is_done = LLMClient._parse_sse_line(bytes(buffer))
+            if not is_done:
+                if reason and meta is not None:
+                    meta["finish_reason"] = reason
+                if content:
+                    yield content
+
+    @staticmethod
+    def _iter_raw_chunks(response: Any) -> Generator[bytes, None, None]:
+        r"""逐塊讀取原始 bytes —— 刻意唔用 `for line in response`。
+
+        urllib3 `HTTPResponse.__iter__` 會喺內部 buffer 到見 `\n` 先 yield 一行。
+        對端只要持續送「唔含換行」嘅 bytes（每次 socket read 都喺 read timeout
+        內成功），我哋個迴圈本體就永遠唔會執行 —— deadline 同 should_stop 一次
+        都檢查唔到，照樣無限卡死，而且 urllib3 內部 buffer 會無限增長。
+
+        呢個唔止係惡意端點：SSE 規範容許裸 `\r` 做行結束符，一個合法但用 `\r`
+        嘅服務商／代理就會踩中同一條路徑。
+
+        測試用假物件冇 `stream()` 時退回逐行迭代（該路徑只有行級保護）。
+        該路徑沿用舊契約「一次迭代＝一行」：真 urllib3 會連 `\n` 一齊 yield，
+        假物件唔一定會，所以缺行結束符時補返一個，令下游統一用同一套分行邏輯。
+        """
+        stream = getattr(response, "stream", None)
+        if stream is None:
+            for line in response:
+                yield line if line.endswith((b"\n", b"\r")) else line + b"\n"
+            return
+        yield from stream(_SSE_READ_CHUNK_BYTES, decode_content=True)
+
+    @staticmethod
+    def _find_line_end(buffer: bytearray) -> tuple[int, int]:
+        r"""搵下一個行結束符，回傳 (位置, 要跳過的位元組數)。
+
+        支援 `\n`、`\r`、`\r\n` 三種（SSE 規範全部容許）。冇完整行時回 (-1, 0)。
+        """
+        idx_n = buffer.find(b"\n")
+        idx_r = buffer.find(b"\r")
+        if idx_n < 0 and idx_r < 0:
+            return -1, 0
+        if idx_n < 0:
+            idx = idx_r
+        elif idx_r < 0:
+            idx = idx_n
+        else:
+            idx = min(idx_n, idx_r)
+        skip = 2 if buffer[idx:idx + 2] == b"\r\n" else 1
+        return idx, skip
+
+    @staticmethod
+    def _parse_sse_line(raw_line: bytes) -> tuple[str, str, bool]:
+        """解析單行 SSE → (content, finish_reason, is_done)。"""
+        line = raw_line.decode("utf-8", errors="replace").strip()
+
+        if not line or not line.startswith("data:"):
+            return "", "", False
+
+        data_str = line[len("data:"):].strip()
+        if data_str == _SSE_DONE_SENTINEL:
+            return "", "", True
+
+        try:
+            data = json.loads(data_str)
+        except json.JSONDecodeError:
+            logger.debug("SSE 行 JSON 解析跳過: %s", data_str[:80])
+            return "", "", False
+
+        return _extract_delta_content(data), _extract_finish_reason(data), False
 
     @staticmethod
     def _parse_sync_response(response: Any) -> ChatResponse:

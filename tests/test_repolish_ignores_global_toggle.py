@@ -131,7 +131,11 @@ class TestRepolishWhenGlobalToggleOff:
 
         with patch.object(va, "_invoke_gui") as mock_gui, \
                 patch("llm.client.LLMClient.chat_with_warnings") as mock_chat:
-            mock_chat.return_value = (iter(["潤色後文字"]), [])
+            # generator 而唔係 iter([...])：真 client 契約係 Generator，
+            # processor 會 close() 它來關掉未讀完的連線
+            def _gen():
+                yield "潤色後文字"
+            mock_chat.return_value = (_gen(), [])
             va._run_repolish()
 
         mock_chat.assert_called_once()

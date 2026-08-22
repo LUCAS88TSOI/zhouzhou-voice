@@ -83,7 +83,11 @@ class TestLLMResultTruncated:
             def chat_with_warnings(self, messages, stream=True, meta=None, should_stop=None):
                 if meta is not None:
                     meta["finish_reason"] = "length"
-                return iter(["半截"]), []
+                # generator 而唔係 iter([...])：真 client 契約係 Generator，
+                # processor 會 close() 它來關掉未讀完的連線
+                def _gen():
+                    yield "半截"
+                return _gen(), []
 
         processor = LLMProcessor.__new__(LLMProcessor)
         processor._client = FakeClient()
@@ -99,7 +103,9 @@ class TestLLMResultTruncated:
             def chat_with_warnings(self, messages, stream=True, meta=None, should_stop=None):
                 if meta is not None:
                     meta["finish_reason"] = "stop"
-                return iter(["完整"]), []
+                def _gen():
+                    yield "完整"
+                return _gen(), []
 
         processor = LLMProcessor.__new__(LLMProcessor)
         processor._client = FakeClient()

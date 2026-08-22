@@ -194,7 +194,10 @@ class LLMConfig:
     # 主服務商失敗時是否允許把同一份逐字稿改送其他已填 key 的服務商。
     # 預設關閉：資料離開原本指定的收件方屬於隱私決定，必須由用戶明示同意（U14）。
     allow_provider_failover: bool = False
-    polish_timeout: float = 10.0        # 語音潤色逾時上限（秒），超時直接貼原文；0 = 不限制
+    # 潤色逾時上限（秒），超時直接貼原文。0 = 沿用設定頁上限（120s），
+    # 唔係真無限 —— 無限等就係卡死（見 DEVLOG 2026-08-22）。
+    # 長文本會按字數自動放寬，見 app.py:_polish_timeout_for()。
+    polish_timeout: float = 10.0
     min_polish_chars: int = 4           # 識別文字達此字數才送 LLM 潤飾（沿用舊硬編碼 _MIN_LLM_LENGTH 預設值）
 
     def __post_init__(self) -> None:
@@ -202,6 +205,11 @@ class LLMConfig:
         # 只做下限防禦（壞值/非數字/inf fallback 到 4，clamp 到 1），不做上限 clamp（用戶要求「無上限」）
         chars = _safe_int(self.min_polish_chars, 4, 1)
         object.__setattr__(self, "min_polish_chars", chars)
+        # polish_timeout 由 %APPDATA% 的 JSON 原樣載入，可能係 null／字串／inf。
+        # 呢個值之後會參與乘法運算，壞值會令每一次潤色都拋 TypeError（功能全滅）。
+        object.__setattr__(
+            self, "polish_timeout", _safe_float(self.polish_timeout, 10.0, 0.0),
+        )
 
 
 @dataclass(frozen=True)

@@ -120,6 +120,20 @@ class VoiceApp:
         "如需潤色請到 設定 → LLM 填入 API Key"
     )
 
+    # 檔案轉譯逐段潤色：每段 1500 字、輸出等長，polish_timeout（預設 10s）
+    # 唔夠用，但仍然必須有限 —— 無限等就係卡死。
+    _FILE_POLISH_TIMEOUT_SCALE: float = 6.0
+
+    # 逾時預算要跟輸入長度走。潤色輸出長度同輸入相當，而 compute_max_tokens()
+    # 會為長輸入把 max_tokens 抬到 32768（即刻意支援「輸出一萬幾千字」），
+    # 若同一次請求淨係俾 10 秒，長選取文字／長逐字稿必定逾時 —— 由「慢但成功」
+    # 變成「永遠失敗」。同 compute_max_tokens 一樣：只往上調，永不低於設定值。
+    _POLISH_SECONDS_PER_CHAR: float = 0.06   # 保守估 ~17 字/秒輸出
+    _POLISH_TIMEOUT_MAX: float = 300.0       # 對齊 client 硬上限天花板
+    # polish_timeout=0 舊註解寫「不限制」，但無限等就係本次要修的卡死。
+    # 統一詮釋成「用設定頁上限」，唔再係真無限。
+    _POLISH_TIMEOUT_UNLIMITED: float = 120.0
+
     def __init__(self) -> None:
         self._config: AppConfig | None = None
         self._lifecycle = LifecycleManager()
@@ -898,6 +912,15 @@ class VoiceApp:
             self._invoke_gui("set_status", (str, "LLM 處理中..."))
             result = self._try_llm_polish(selected, role_override=repolish_role, llm_processor=llm_processor)
             polished = result.text
+            if result.error == "潤色逾時":
+                # 逾時時 polished 就係原文，照樣 paste 會用純文字覆寫用戶原本
+                # 嘅選取內容（格式、超連結、樣式全丟），零收益純破壞。
+                # 其他失敗（API/網絡）維持既有「貼返原文、唔靜默中斷」行為。
+                self._invoke_gui(
+                    "notify_warning",
+                    (str, "⚠ 潤色選取文字逾時，已保留原本選取內容"),
+                )
+                return
             if not result.success:
                 self._invoke_gui(
                     "notify_warning",
@@ -1032,7 +1055,9 @@ class VoiceApp:
         final_status = "完成"
         try:
             source = self._last_pre_llm_text or self._last_result
-            logger.info("重新潤色開始: %r", source[:60])
+            # 同 _run_polish_selection 一致：只記長度不記內容（密碼通常短於 60 字）
+            logger.info("重新潤色開始: %d 個字元", len(source))
+            logger.debug("重新潤色來源: %r", source[:60])
 
             llm_processor, repolish_role = self._build_repolish_processor()
             if llm_processor is None:
@@ -1299,7 +1324,7 @@ class VoiceApp:
             t = time.monotonic()
             if self._config and self._config.llm.enabled and not skip_llm:
                 self._invoke_gui("set_status", (str, "潤色中..."))
-                result = self._try_llm_polish(text, enforce_timeout=True)
+                result = self._try_llm_polish(text)
                 text = result.text
                 timings["LLM"] = time.monotonic() - t
                 if result.success:
@@ -1309,8 +1334,9 @@ class VoiceApp:
                     # 「還沒設定」不是失敗：整個 session 只提示一次（U1）
                     self._notify_llm_not_configured()
                 elif result.error == "潤色逾時":
-                    # 逾時 → 貼原文 + 專屬提示
-                    _to = int(self._config.llm.polish_timeout)
+                    # 逾時 → 貼原文 + 專屬提示（逾時後 result.text 就係原文，
+                    # 所以用 text 重算出嚟嘅預算同實際用嗰個一致）
+                    _to = int(self._polish_timeout_for(text))
                     self._invoke_gui(
                         "notify_warning",
                         (str, f"⚠ 潤色逾時（>{_to}s），已貼原文"),
@@ -1656,9 +1682,22 @@ class VoiceApp:
             (str, f"⚠ 主服務商失敗，本次潤色已改用「{name}」（{used_provider}）完成"),
         )
 
+    def _polish_timeout_for(self, text: str, timeout_scale: float = 1.0) -> float:
+        """算出本次潤色的逾時預算（秒）。
+
+        取「設定值×倍數」同「按輸入長度估算」兩者較大值 —— 短句用設定值，
+        長文本自動放寬，避免長選取文字／長逐字稿 100% 逾時失敗。
+        `polish_timeout=0`（舊註解寫「不限制」）視為設定頁上限，唔係真無限。
+        """
+        base = self._config.llm.polish_timeout if self._config else 0.0
+        if not isinstance(base, (int, float)) or base <= 0:
+            base = self._POLISH_TIMEOUT_UNLIMITED
+        by_length = len(text) * self._POLISH_SECONDS_PER_CHAR
+        return min(max(base * timeout_scale, by_length), self._POLISH_TIMEOUT_MAX)
+
     def _try_llm_polish(
         self, text: str, role_override: str = "", llm_processor=None,
-        enforce_timeout: bool = False,
+        timeout_scale: float = 1.0,
     ):
         """嘗試用 LLM 潤色文字。返回結構化狀態。
 
@@ -1666,8 +1705,11 @@ class VoiceApp:
             text: 要潤色的文字
             role_override: 覆蓋角色 ID，空字串使用預設角色
             llm_processor: 覆蓋 LLM 處理器，None 使用預設處理器
-            enforce_timeout: True 時套用 polish_timeout 上限，逾時直接回原文
-                             （僅主語音管線用；repolish / 檔案轉錄不套）
+            timeout_scale: polish_timeout 的倍數。逾時上限一律套用於**所有**
+                           路徑 —— 舊設計只有主語音管線套，重新潤色／潤色選取／
+                           歷史重處理／檔案轉譯全部無限等，服務商送 keep-alive
+                           心跳時就永遠卡死（2026-08-22 日誌實證）。批次路徑
+                           （檔案轉譯逐段）用較大倍數，但仍然有限。
 
         Returns:
             LLMResultStatus: 結構化狀態（含 success, text, was_processed, error）
@@ -1700,14 +1742,11 @@ class VoiceApp:
 
             self._invoke_gui("set_status", (str, "LLM 處理中..."))
 
-            # 逾時保護：超過 polish_timeout 秒自動停止，貼出未潤色原文
-            timeout_s = self._config.llm.polish_timeout if self._config else 0.0
-            should_stop = None
-            request_timeout = None
-            if enforce_timeout and timeout_s and timeout_s > 0:
-                deadline = _time.monotonic() + timeout_s
-                should_stop = lambda: _time.monotonic() >= deadline  # noqa: E731
-                request_timeout = timeout_s
+            # 逾時保護：夠鐘自動停止，貼出未潤色原文
+            timeout_s = self._polish_timeout_for(text, timeout_scale)
+            deadline = _time.monotonic() + timeout_s
+            should_stop = lambda: _time.monotonic() >= deadline  # noqa: E731
+            request_timeout = timeout_s
 
             logger.info("LLM 潤色中...")
             result = processor.process(
@@ -1778,7 +1817,14 @@ class VoiceApp:
                     self._invoke_gui("append_result", (str, f"[提示] {w}"))
 
             if result.text and result.text != text:
-                logger.info("LLM 潤色: %s → %s", text, result.text)
+                # 只記長度不記內容：呢個函數同時服務「潤色選取文字」，來源係
+                # 用戶當下剪貼板，可能係密碼或私訊。_run_polish_selection 特登
+                # 只記長度（見該函數註解），呢度全文落 log 就會抵銷咗嗰個防護
+                # ——用戶常把 app.log 貼上 issue。全文只喺用戶主動開 DEBUG 先記。
+                logger.info(
+                    "LLM 潤色完成: %d 字 → %d 字", len(text), len(result.text),
+                )
+                logger.debug("LLM 潤色: %s → %s", text, result.text)
                 return LLMResultStatus(
                     success=True,
                     text=result.text,
@@ -1813,7 +1859,9 @@ class VoiceApp:
 
         try:
             if len(text) <= _CHUNK_SIZE:
-                result = self._try_llm_polish(text)
+                result = self._try_llm_polish(
+                    text, timeout_scale=self._FILE_POLISH_TIMEOUT_SCALE,
+                )
                 # Bug 修復：只有成功時才保存
                 if not result.success:
                     logger.info("LLM 優化失敗，跳過保存: %s", result.error or "unknown error")
@@ -1854,7 +1902,9 @@ class VoiceApp:
 
         sentences = smart_split(text)
         if not sentences:
-            return self._try_llm_polish(text).text
+            return self._try_llm_polish(
+                text, timeout_scale=self._FILE_POLISH_TIMEOUT_SCALE,
+            ).text
 
         chunks: list[str] = []
         current: list[str] = []
@@ -1873,7 +1923,12 @@ class VoiceApp:
 
         if self._llm is None or self._config is None:
             # 無 LLM：fallback 到逐段呼叫（保留既有錯誤路徑）
-            return "\n".join(self._try_llm_polish(c).text for c in chunks)
+            return "\n".join(
+                self._try_llm_polish(
+                    c, timeout_scale=self._FILE_POLISH_TIMEOUT_SCALE,
+                ).text
+                for c in chunks
+            )
 
         # 解析當前角色（一次性）
         role = resolve_role(
@@ -1894,6 +1949,10 @@ class VoiceApp:
             llm_processor=self._llm,
             role=role,
             on_chunk_start=_on_chunk_start,
+            # 逐段預算按最長那段算（各段長度相近，chunk_size 上限一致）
+            request_timeout=self._polish_timeout_for(
+                max(chunks, key=len), self._FILE_POLISH_TIMEOUT_SCALE,
+            ),
         )
         return "\n".join(polished_parts)
 

@@ -568,6 +568,7 @@ def polish_transcription_with_context(
     llm_processor,
     role,
     on_chunk_start: Optional[Callable[[int, int], None]] = None,
+    request_timeout: Optional[float] = None,
 ) -> List[str]:
     """
     對多段轉錄文本做 LLM 潤色，段間以滑動窗口（N=2）注入上下文。
@@ -585,6 +586,10 @@ def polish_transcription_with_context(
         llm_processor:   `llm.processor.LLMProcessor` 實例
         role:            `llm.processor.RoleConfig` 角色配置
         on_chunk_start:  每段開始時回調 (index, total)，用於進度條
+        request_timeout: 每段的逾時上限（秒）。每段各自計時 —— 共用一個全域
+                         截止時間會令後面段被前面段的耗時誤殺。None 代表不
+                         設限（僅測試／舊呼叫端用；正式路徑一律傳值，否則
+                         服務商送 keep-alive 心跳時整個轉譯會永遠卡住）。
 
     Returns:
         與 chunks 等長的潤色結果列表；失敗段保留原文。
@@ -616,13 +621,37 @@ def polish_transcription_with_context(
             idx + 1, total, len(history), len(raw), len(prefix),
         )
 
+        # 每段各自計時：共用全域截止時間會令後面段被前面段耗時誤殺
+        should_stop = None
+        if request_timeout and request_timeout > 0:
+            chunk_deadline = time.monotonic() + request_timeout
+            should_stop = (
+                lambda deadline=chunk_deadline: time.monotonic() >= deadline
+            )
+
         try:
             result = llm_processor.process(
                 text=user_text,
                 role=safe_role,
+                should_stop=should_stop,
+                request_timeout=request_timeout,
             )
-            if result is None or not result.text or result.error:
-                err_msg = (result.error if result else "unknown") if result else "no result"
+            # was_stopped：逾時中止，result.text 係半截潤色 —— 照收會令用戶
+            # 後半段講嘅話憑空消失，必須 fallback 原文（同主管線一致）
+            if (
+                result is None
+                or not result.text
+                or result.error
+                or getattr(result, "was_stopped", False)
+            ):
+                if result is None:
+                    err_msg = "no result"
+                elif result.error:
+                    err_msg = result.error
+                elif getattr(result, "was_stopped", False):
+                    err_msg = "逾時中止"
+                else:
+                    err_msg = "回應為空"
                 logger.warning(
                     "段 %d LLM 潤色失敗，fallback 原文: %s",
                     idx + 1, err_msg,

@@ -574,22 +574,36 @@ class LLMProcessor:
             stream, call_warnings = active_client.chat_with_warnings(
                 messages, stream=True, meta=meta, should_stop=should_stop,
             )
-            for chunk in stream:
-                # 檢查停止條件（有內容 chunk 時的即時回應路徑）
-                if should_stop is not None and should_stop():
-                    result.was_stopped = True
-                    logger.info("LLM 串流被用戶中途停止")
-                    break
+            try:
+                for chunk in stream:
+                    # 檢查停止條件（有內容 chunk 時的即時回應路徑）
+                    if should_stop is not None and should_stop():
+                        result.was_stopped = True
+                        logger.info("LLM 串流被用戶中途停止")
+                        break
 
-                chunks.append(chunk)
-                result.token_count += 1
+                    chunks.append(chunk)
+                    result.token_count += 1
 
-                # 回調
-                if on_token is not None:
+                    # 回調
+                    if on_token is not None:
+                        try:
+                            on_token(chunk)
+                        except Exception as err:
+                            logger.warning("on_token 回調異常: %s", err)
+            finally:
+                # 提早 break 時主動關閉 generator，觸發 client 層 finally 關掉
+                # 未讀完的連線。唔可以靠 GC —— refcount 回收時機唔保證，
+                # 髒連線會被放返連線池污染下個請求。
+                # 用 getattr 而唔係直接 stream.close()：client 可以係任何注入
+                # 物件；清理失敗唔可以蓋過原本的例外，更加唔可以把一次成功的
+                # 潤色變成 result.error。
+                closer = getattr(stream, "close", None)
+                if closer is not None:
                     try:
-                        on_token(chunk)
+                        closer()
                     except Exception as err:
-                        logger.warning("on_token 回調異常: %s", err)
+                        logger.warning("關閉串流 generator 異常: %s", err)
 
             # 迴圈正常耗盡（無 break）但係喺 client 層因 keep-alive 逾時被中止
             if not result.was_stopped and meta.get("stopped"):

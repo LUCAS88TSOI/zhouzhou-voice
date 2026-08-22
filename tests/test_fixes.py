@@ -177,7 +177,11 @@ class _FakeClient:
                 raise RuntimeError("API Key 無效（HTTP 401）")
                 yield ""  # 令此函數成為 generator（與真 client 一致，惰性拋錯）
             return _gen(), []
-        return iter([self._text]), []
+        # 回傳 generator（唔可以用 iter([...])）：真 client 的契約係 Generator，
+        # processor 會 close() 它來關掉未讀完的連線
+        def _gen():
+            yield self._text
+        return _gen(), []
 
 
 def test_llm_failover_on_auth_error():
