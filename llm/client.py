@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 import socket
 import time
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
@@ -217,6 +217,7 @@ class LLMClient:
         messages: list[dict[str, str]],
         stream: bool = True,
         meta: dict[str, Any] | None = None,
+        should_stop: Callable[[], bool] | None = None,
     ) -> tuple[Generator[str, None, None], list[str]]:
         """
         串流模式 per-call 版本：返回 (generator, warnings_list)。
@@ -230,6 +231,15 @@ class LLMClient:
         Args:
             meta: 若給定，generator 耗盡後會寫入 meta["finish_reason"]，
                   讓呼叫端能偵測 max_tokens 截斷。
+            should_stop: 若給定，逐 SSE 行檢查（包括 keep-alive／註解行）。
+                  部分服務商在正式輸出前會持續送心跳行防止代理逾時斷線；
+                  若只喺「收到內容 chunk」後才檢查逾時，這類心跳會令
+                  should_stop 永遠冇機會被檢查，polish_timeout 形同虛設
+                  （逐次 socket read 都喺 read timeout 內完成，唔會拋例外）。
+                  逾時中止時會在 meta["stopped"] 標記 True（此標記內部一律
+                  可用，即使呼叫端冇傳 meta 亦然，只係唔會反映到呼叫端）。
+                  會逐 SSE 行呼叫（頻率約等於心跳行數），必須夠輕量、無副
+                  作用、唔可以拋例外（拋出會被當成串流解析錯誤處理）。
 
         Returns:
             (generator, warnings_list)
@@ -240,7 +250,7 @@ class LLMClient:
             RuntimeError: HTTP 請求失敗、超時或解析錯誤時拋出
         """
         warnings: list[str] = []
-        gen = self._stream_chat_impl(messages, stream, warnings, meta)
+        gen = self._stream_chat_impl(messages, stream, warnings, meta, should_stop)
         return gen, warnings
 
     def _stream_chat_impl(
@@ -249,6 +259,7 @@ class LLMClient:
         stream: bool,
         warnings: list[str],
         meta: dict[str, Any] | None = None,
+        should_stop: Callable[[], bool] | None = None,
     ) -> Generator[str, None, None]:
         """內部實作：串流 chat，把警告 append 到外部傳入的 list。"""
         request = self._build_chat_request(messages, stream)
@@ -330,14 +341,29 @@ class LLMClient:
             logger.error(msg)
             raise RuntimeError(msg)
 
+        # 內部永遠有 meta 可寫：呼叫端冇傳 meta 時都要知道「係咪逾時中止」，
+        # 否則 finally 判斷唔到要 close() 定 release_conn()（code review MEDIUM）。
+        # 有傳 meta 時 _local_meta 就係同一個物件，寫入照舊會反映到呼叫端。
+        _local_meta: dict[str, Any] = meta if meta is not None else {}
         try:
-            yield from self._parse_sse_stream(response, meta)
+            yield from self._parse_sse_stream(response, _local_meta, should_stop)
         except Exception as err:
             msg = f"串流解析錯誤：{err}"
             logger.error(msg)
             raise RuntimeError(msg)
         finally:
-            response.release_conn()
+            if _local_meta.get("stopped"):
+                # 逾時主動中止：連線可能仲有未讀資料（服務商仲喺度產生 token），
+                # release_conn() 唔會關閉 socket，只會將「未讀完」嘅連線放返
+                # 連線池 —— 若殘留 bytes 未及時到達，下個請求可能複用到呢條
+                # 骯髒連線、解析到殘留 SSE 內容。主動中止時要 close() 唔可以
+                # release_conn()，確保連線唔會被重用（code review MEDIUM）。
+                try:
+                    response.close()
+                except Exception:
+                    pass
+            else:
+                response.release_conn()
 
     def chat_sync(self, messages: list[dict[str, str]]) -> str:
         """
@@ -589,7 +615,9 @@ class LLMClient:
 
     @staticmethod
     def _parse_sse_stream(
-        response: Any, meta: dict[str, Any] | None = None,
+        response: Any,
+        meta: dict[str, Any] | None = None,
+        should_stop: Callable[[], bool] | None = None,
     ) -> Generator[str, None, None]:
         """
         解析 SSE 串流回應。
@@ -604,8 +632,17 @@ class LLMClient:
             meta: 若給定，串流結束時寫入 meta["finish_reason"]。
                   呼叫端據此判斷回覆是否被 max_tokens 截斷（"length"），
                   否則半截文字會被當成完整結果貼出去。
+            should_stop: 若給定，每收到一行（包括 keep-alive／註解行，
+                  唔止有內容嗰啲）就檢查一次；逾時即中止讀取並在
+                  meta["stopped"] 標記 True，避免心跳行拖住逾時保護。
         """
         for raw_line in response:
+            if should_stop is not None and should_stop():
+                logger.info("SSE 串流讀取中偵測到 should_stop，中止讀取")
+                if meta is not None:
+                    meta["stopped"] = True
+                return
+
             line = raw_line.decode("utf-8", errors="replace").strip()
 
             if not line:

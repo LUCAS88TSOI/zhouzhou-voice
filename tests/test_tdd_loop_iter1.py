@@ -426,7 +426,7 @@ class TestBug4LLMProcessorConcurrentSafety:
             block_event.wait(timeout=3.0)
             yield "polished"
 
-        def fake_chat_with_warnings(messages, stream=True, meta=None):
+        def fake_chat_with_warnings(messages, stream=True, meta=None, should_stop=None):
             # iter 3 Bug C：新 API 返回 (generator, warnings_list)
             return fake_chat(messages, stream=stream), []
 

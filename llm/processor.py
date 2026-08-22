@@ -468,7 +468,9 @@ class LLMProcessor:
                 on_token=on_token,
                 should_stop=should_stop,
             )
-            if not result.error:
+            # was_stopped（逾時中止）也算 error=="" —— 唔算真正成功，
+            # 否則會被誤判為「降級成功」（code review LOW）。
+            if not result.error and not result.was_stopped:
                 logger.info("LLM 降級成功：%s (%s)", prov.key, prov.name)
                 result.used_provider = prov.key
                 return result
@@ -565,11 +567,15 @@ class LLMProcessor:
         # 時 instance 上的 _param_warnings 被其他 thread 覆蓋造成 UX 洩漏。
         meta: dict[str, Any] = {}
         try:
+            # should_stop 一路傳到 client 層：逐 SSE 行檢查（含 keep-alive／
+            # 註解行），否則服務商「思考」階段狂送心跳、從不產出內容 chunk 時，
+            # 呢個 for 迴圈永遠冇機會執行到 body，should_stop 形同虛設，
+            # polish_timeout 就會卡到永遠（真實 bug：見 test_polish_keepalive_timeout.py）。
             stream, call_warnings = active_client.chat_with_warnings(
-                messages, stream=True, meta=meta,
+                messages, stream=True, meta=meta, should_stop=should_stop,
             )
             for chunk in stream:
-                # 檢查停止條件
+                # 檢查停止條件（有內容 chunk 時的即時回應路徑）
                 if should_stop is not None and should_stop():
                     result.was_stopped = True
                     logger.info("LLM 串流被用戶中途停止")
@@ -584,6 +590,11 @@ class LLMProcessor:
                         on_token(chunk)
                     except Exception as err:
                         logger.warning("on_token 回調異常: %s", err)
+
+            # 迴圈正常耗盡（無 break）但係喺 client 層因 keep-alive 逾時被中止
+            if not result.was_stopped and meta.get("stopped"):
+                result.was_stopped = True
+                logger.info("LLM 串流在 keep-alive／無內容期間逾時被中止")
 
         except RuntimeError as err:
             # LLM client 拋出的具體錯誤

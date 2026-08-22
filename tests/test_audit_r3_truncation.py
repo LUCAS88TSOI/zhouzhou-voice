@@ -80,7 +80,7 @@ class TestLLMResultTruncated:
         from llm.processor import LLMProcessor
 
         class FakeClient:
-            def chat_with_warnings(self, messages, stream=True, meta=None):
+            def chat_with_warnings(self, messages, stream=True, meta=None, should_stop=None):
                 if meta is not None:
                     meta["finish_reason"] = "length"
                 return iter(["半截"]), []
@@ -96,7 +96,7 @@ class TestLLMResultTruncated:
         from llm.processor import LLMProcessor
 
         class FakeClient:
-            def chat_with_warnings(self, messages, stream=True, meta=None):
+            def chat_with_warnings(self, messages, stream=True, meta=None, should_stop=None):
                 if meta is not None:
                     meta["finish_reason"] = "stop"
                 return iter(["完整"]), []

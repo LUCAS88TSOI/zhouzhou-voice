@@ -171,7 +171,7 @@ class _FakeClient:
     def __init__(self, text):
         self._text = text
 
-    def chat_with_warnings(self, messages, stream=True, meta=None):
+    def chat_with_warnings(self, messages, stream=True, meta=None, should_stop=None):
         if self._text is None:
             def _gen():
                 raise RuntimeError("API Key 無效（HTTP 401）")

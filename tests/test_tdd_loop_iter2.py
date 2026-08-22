@@ -59,7 +59,7 @@ class TestBug3ClearHistoryEpochRace:
             block.wait(timeout=3.0)
             yield "new-assistant-reply"
 
-        def fake_chat_with_warnings(messages, stream=True, meta=None):
+        def fake_chat_with_warnings(messages, stream=True, meta=None, should_stop=None):
             # iter 3 Bug C：新 per-call API 回傳 (generator, warnings_list)
             return fake_chat(messages, stream=stream), []
 
